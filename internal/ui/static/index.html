@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Supermessy Bot</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">Supermessy&nbsp;Bot</div>
+  <select id="game" title="Партия"></select>
+  <div class="nav">
+    <button id="prev" title="Предыдущий заход (←)">◀</button>
+    <input id="visit" type="range" min="1" max="1" value="1">
+    <button id="next" title="Следующий заход (→)">▶</button>
+    <button id="play" title="Проиграть заходы подряд">▶▶</button>
+    <span id="visitLabel" class="label"></span>
+  </div>
+  <span id="mode" class="badge"></span>
+  <label class="live"><input id="live" type="checkbox" checked> следить</label>
+</header>
+
+<section class="kpis" id="kpis"></section>
+
+<main class="layout">
+  <div class="mapwrap">
+    <svg id="map" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <pattern id="hatch" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+          <line x1="0" y1="0" x2="0" y2="8" class="hatch"/>
+        </pattern>
+        <marker id="arrow-attack" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="m-attack"/></marker>
+        <marker id="arrow-defense" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="m-defense"/></marker>
+        <marker id="arrow-retreat" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="m-retreat"/></marker>
+      </defs>
+      <g id="viewport">
+        <g id="provinces"></g>
+        <g id="labels"></g>
+        <g id="marches"></g>
+        <g id="orders"></g>
+        <g id="armies"></g>
+        <g id="marks"></g>
+      </g>
+    </svg>
+    <div class="mapctl">
+      <button id="zin" title="Приблизить">+</button>
+      <button id="zout" title="Отдалить">−</button>
+      <button id="zfit" title="К нашей стране">⌂</button>
+    </div>
+    <div class="layers">
+      <label><input type="checkbox" data-layer="armies" checked> армии</label>
+      <label><input type="checkbox" data-layer="orders" checked> приказы</label>
+      <label><input type="checkbox" data-layer="marches" checked> марши</label>
+      <label><input type="checkbox" data-layer="labels" checked> названия</label>
+    </div>
+    <div class="legend" id="legend"></div>
+    <div class="tip" id="tip"></div>
+    <div class="empty" id="mapEmpty" hidden>Карты для этой партии ещё нет: она появится после первого захода бота.</div>
+  </div>
+
+  <aside class="panel">
+    <nav class="tabs">
+      <button data-tab="decisions" class="on">Решения</button>
+      <button data-tab="summary">Сводка</button>
+      <button data-tab="province">Провинция</button>
+    </nav>
+    <div class="tab" id="tab-decisions">
+      <div class="filters">
+        <div class="chips" id="chips"></div>
+        <div class="row">
+          <input id="search" type="search" placeholder="Поиск: провинция, правило, причина…">
+          <label><input id="notes" type="checkbox" checked> заметки</label>
+        </div>
+      </div>
+      <div class="endline" id="endline"></div>
+      <ol class="list" id="list"></ol>
+    </div>
+    <div class="tab" id="tab-summary" hidden></div>
+    <div class="tab" id="tab-province" hidden><p class="muted">Нажмите на провинцию на карте.</p></div>
+  </aside>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

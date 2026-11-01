@@ -1,0 +1,1577 @@
+package s1914
+
+// Состав партии живёт не в web-API лобби, а на игровом сервере (gs) — том
+// самом, с которым разговаривает клиент игры в браузере. Путь до него такой:
+//
+//	getGameToken            → адрес gs и токен на вход в партию
+//	UltActivateGameAction   → наш playerID в этой партии
+//	UltUpdateGameStateAction → полное состояние: игроки, карта, день
+//
+// Подписи, как в index.php, здесь нет: gs верит токену из getGameToken.
+//
+// Входом в партию игра считает ровно средний шаг — активацию. Без него
+// состояние приходит глазами наблюдателя: то же самое, но своего игрока
+// в нём нет, а партия не запоминает, что мы заходили. Отсюда два пути:
+//
+//	GameState   — игроком: нужен свой playerID, но заход засчитывается,
+//	              поэтому дёргать его по таймеру не стоит.
+//	ObserveGame — наблюдателем: годится для любой партии, в том числе
+//	              чужой, и следа в ней не оставляет.
+//
+// Токен gs сайт выдаёт и по чужой партии — участие он не проверяет.
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	// Версия и клиент, которыми представляется браузерный клиент игры.
+	// Версия здесь — только начальная догадка: игру обновляют без нас, и на
+	// устаревшую она отвечает отказом, из которого видно нужный номер.
+	gsVersionDefault = "316"
+	gsClient         = "s1914-client-mobile"
+)
+
+// reDeployedVersion достаёт актуальный номер клиента из жалобы игры:
+// «User client/version for s1914-client-mobile: #316, Deployed client
+// version s1914-client-mobile_live: #317».
+var reDeployedVersion = regexp.MustCompile(`Deployed client version [^:]*: #(\d+)`)
+
+// gsException — игровой сервер вернул не ответ, а своё исключение.
+type gsException struct {
+	class  string
+	detail string
+}
+
+func (e *gsException) Error() string {
+	name := strings.TrimPrefix(e.class, "ultshared.")
+	if e.detail == "" {
+		return name
+	}
+	return name + ": " + e.detail
+}
+
+// version — номер клиента, которого игре не хватило, если отказ именно об этом.
+func (e *gsException) version() string {
+	if !strings.Contains(e.class, "ClientVersionMismatch") {
+		return ""
+	}
+	if m := reDeployedVersion.FindStringSubmatch(e.detail); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// Province — провинция на карте партии. Море и озёра сюда не попадают.
+// Owner = 0 означает ничейную землю: игрока с таким номером не бывает.
+type Province struct {
+	ID      int
+	Name    string
+	Owner   int
+	Morale  float64
+	Capital bool
+	// Built — какие здания в провинции есть, номерами из справочника,
+	// в том числе недостроенные и повреждённые: готово ли здание, говорит
+	// Condition (см. GameState.Finished).
+	// зданий. Уровень здания игра держит отдельно, и нам он не нужен:
+	// повторная постройка того же здания и есть следующий уровень.
+	Built []int
+	// Condition — состояние каждого здания из Built («c» у игры). Здание
+	// готово, когда оно кратно BuildCondition своего типа.
+	Condition map[int]int
+	// Building — стройки, идущие сейчас. Обычно не больше одной: второй
+	// слот даёт премиум, и тогда их бывает две.
+	Building []Construction
+	// Slots — сколько строек в провинции можно вести разом. Ноль означает
+	// «игра не сказала»; считаем такую провинцию односложной.
+	Slots int
+	// Producing — войска, которые производятся сейчас, и ProdSlots —
+	// сколько их можно производить разом (обычно одно).
+	Producing []Production
+	ProdSlots int
+	// CanProduce — какие войска провинция может заказать прямо сейчас:
+	// номер типа → запись «su» в том виде, в каком её шлёт клиент игры.
+	// Решает это сама игра (нужное здание, исследование); у чужих
+	// провинций пусто.
+	CanProduce map[int]json.RawMessage
+	// Output — суточная добыча провинции по ресурсам («arp»): игра считает
+	// её сама, со всеми бонусами, и присылает про все провинции.
+	Output map[int]float64
+	// Population — население («p»), от него зависит потребление провинции;
+	// StateID — её состояние («pst»): от него — во сколько раз.
+	Population float64
+	StateID    int
+	// Enabled — включено ли здание («e» у записи «mu»). Выключенное здание
+	// не работает и не берёт содержание: так отключают казарму, когда
+	// не хватает еды.
+	Enabled map[int]bool
+	// Cores — чьё это коренное владение («ci»), LegalOwner — законный
+	// владелец («lo»), VictoryPoints — сколько очков провинция даёт («vp»).
+	Cores         []int
+	LegalOwner    int
+	VictoryPoints int
+	// MaxOutput — добыча при полном боевом духе («mpm»), Configured — базовая
+	// добыча по сценарию («cp»). По Configured игра решает, двойная ли
+	// провинция; в урезанном состоянии его нет, и тогда берём MaxOutput.
+	MaxOutput  map[int]float64
+	Configured map[int]float64
+}
+
+// MainResource — какой ресурс провинция добывает, кроме денег. −1 — никакой.
+func (p Province) MainResource() int {
+	for _, src := range []map[int]float64{p.Configured, p.MaxOutput, p.Output} {
+		best, id := -1.0, -1
+		for res, v := range src {
+			if res != ResourceMoney && v > best {
+				best, id = v, res
+			}
+		}
+		if id >= 0 {
+			return id
+		}
+	}
+	return -1
+}
+
+// BaseOutput — базовая добыча главного ресурса: по ней игра решает,
+// двойная ли провинция.
+func (p Province) BaseOutput() float64 {
+	res := p.MainResource()
+	if res < 0 {
+		return 0
+	}
+	if v, ok := p.Configured[res]; ok {
+		return v
+	}
+	if v, ok := p.MaxOutput[res]; ok {
+		return v
+	}
+	return p.Output[res]
+}
+
+// ProdFree — свободен ли слот под производство войск.
+func (p Province) ProdFree() bool {
+	slots := p.ProdSlots
+	if slots < 1 {
+		slots = 1
+	}
+	return len(p.Producing) < slots
+}
+
+// ProducesUntil — когда закончится самое раннее из идущих производств.
+// Нулевое время — ничего не производится.
+func (p Province) ProducesUntil() time.Time {
+	var first time.Time
+	for _, c := range p.Producing {
+		if first.IsZero() || c.Ends.Before(first) {
+			first = c.Ends
+		}
+	}
+	return first
+}
+
+// Production — войско, которое производится в провинции, и когда будет готово.
+type Production struct {
+	UnitTypeID int
+	Ends       time.Time
+}
+
+// UnitType — тип войск из справочника партии. В нём только то, что
+// можно заказать: пехоту игра даёт призывом, героев — отдельно.
+type UnitType struct {
+	ID   int
+	Name string
+	// Image — имя картинки у игры («car»).
+	Image string
+	Cost  map[int]float64
+	// Set — род войск: 1 суша, 2 воздух, 3 море.
+	Set int
+}
+
+// Free — свободен ли слот под стройку.
+func (p Province) Free() bool {
+	slots := p.Slots
+	if slots < 1 {
+		slots = 1
+	}
+	return len(p.Building) < slots
+}
+
+// BuildsUntil — когда закончится самая ранняя из идущих строек. Нулевое
+// время означает, что в провинции не строят ничего.
+func (p Province) BuildsUntil() time.Time {
+	var first time.Time
+	for _, c := range p.Building {
+		if first.IsZero() || c.Ends.Before(first) {
+			first = c.Ends
+		}
+	}
+	return first
+}
+
+// Construction — стройка, идущая в провинции: что строят и когда кончат.
+// Время окончания называет сама игра, считать его самим не нужно.
+type Construction struct {
+	UpgradeID int
+	Ends      time.Time
+}
+
+// Upgrade — здание из справочника партии. Справочник приходит вместе
+// с состоянием, поэтому названия в нём уже на языке аккаунта, а цены —
+// те, что действуют в этой партии.
+// Уровни здания игра держит отдельными записями: «Крепость» второго уровня
+// — своё здание, заменяющее собой первое. Replaces говорит, какое именно,
+// а Tier считается по этой цепочке: у первого уровня он единица. Без него
+// в списке стояло бы пять одинаковых «Крепостей».
+type Upgrade struct {
+	ID       int
+	Name     string
+	Build    time.Duration   // сколько строится по справочнику, настоящими часами
+	Cost     map[int]float64 // ресурс → сколько стоит
+	Replaces int
+	Tier     int
+	// Image — имя картинки у игры («railway»); уровни одного здания
+	// делят одну картинку.
+	Image string
+	// BuildCondition — сколько состояния даёт один уровень («bc»).
+	// Состояние здания, не кратное ему, — недостроенный или повреждённый
+	// уровень: игра показывает на нём «Ремонт».
+	BuildCondition int
+	// Available — день партии, с которого здание можно строить («doa»):
+	// железная дорога, например, открывается на третий. Раньше игра
+	// стройку не принимает.
+	Available int
+	// DailyCosts — содержание здания в сутки при полном состоянии («dc»),
+	// MaxCondition — полное состояние («mxc»).
+	DailyCosts   map[int]float64
+	MaxCondition int
+}
+
+// Resource — запас ресурса и скорость его прихода. Игра отдаёт запас
+// на момент Measured и прирост в секунду — уже за вычетом расхода,
+// поэтому он бывает и отрицательным.
+type Resource struct {
+	ID       int
+	Name     string
+	Amount   float64
+	Measured time.Time
+	Rate     float64
+	// Daily — тот же прирост за игровые сутки, как его показывает игра.
+	Daily float64
+}
+
+// AmountAt — сколько ресурса будет к этому времени.
+func (r Resource) AmountAt(t time.Time) float64 {
+	return r.Amount + r.Rate*t.Sub(r.Measured).Seconds()
+}
+
+// Enough — когда запаса хватит на need. Второе значение ложно, если
+// не хватит никогда: запас не растёт или тает.
+func (r Resource) Enough(need float64, now time.Time) (time.Time, bool) {
+	if r.AmountAt(now) >= need {
+		return now, true
+	}
+	if r.Rate <= 0 {
+		return time.Time{}, false
+	}
+	secs := (need - r.Amount) / r.Rate
+	return r.Measured.Add(time.Duration(secs * float64(time.Second))), true
+}
+
+// ArmyUnit — одна пачка юнитов одного типа в армии.
+type ArmyUnit struct {
+	Type int
+	Size int
+	// HasNames — у юнита есть список имён (у героини он приходит пустым).
+	// Игра ждёт это поле обратно ровно там, где сама его прислала.
+	HasNames bool
+}
+
+// Army — армия на карте. Полей у неё втрое больше, но нам хватает тех,
+// что игра требует вернуть вместе с командой.
+type Army struct {
+	ID       int64
+	Owner    int
+	Size     int
+	Location int
+	Units    []ArmyUnit
+	// Deploying — армия уже занята размещением: у неё стоит команда «dwc»,
+	// то есть героиня призывает пехоту и до конца срока неподвижна.
+	// DeployLeft — сколько осталось по часам игрового сервера; они идут
+	// быстрее настоящих ровно во столько раз, во сколько ускорена партия.
+	Deploying  bool
+	DeployLeft time.Duration
+	// Pos — где армия стоит или куда дошла по дороге.
+	Pos MapPoint
+	// Fighting — армия занята боем: сражается, обстреливает, осаждает или
+	// отступает («fs» не ноль), либо на неё кто-то нападает.
+	Fighting bool
+	// MarchTo — куда армия идёт сейчас: конец последнего отрезка марша.
+	// Пусто, если армия стоит.
+	MarchTo *MapPoint
+	// AttackTarget — армия, на которую эта нападает («au»); ноль — ни на кого.
+	AttackTarget int64
+	// Commands — сколько команд в очереди армии: ноль — стоит без дела.
+	Commands int
+}
+
+// Player — игрок партии: страна, имя на сайте и что с ним стало.
+// Color — цвет страны на карте, в виде готовой CSS-строки.
+// SiteUserID — его номер на сайте игры: тот самый «игровой ID», который
+// вписывают в карточку, поэтому по нему партия и сводится с базой.
+type Player struct {
+	ID         int
+	Nation     string
+	Name       string
+	SiteUserID string
+	Color      string
+	// TeamID — коалиция игрока в этой партии. Ноль означает «сам по себе»:
+	// так игра помечает всех, кто ни в какой коалиции не состоит.
+	TeamID int
+	// Premium — подписка «Высокое командование» у игрока. Игра сообщает
+	// её про всех участников партии, а не только про нас, и знать это
+	// полезно: премиум даёт и лишний слот производства, и ускорения.
+	Premium bool
+	// Banned — аккаунт игрока забанен. Это свойство аккаунта, а не партии,
+	// поэтому его и стоит запоминать: в следующий раз человек может нам
+	// и не встретиться, а знать о бане будет полезно.
+	Banned bool
+	IsAI   bool
+	// NativeAI — страна компьютерная с начала партии. Одного IsAI мало:
+	// его игра ставит и стране, брошенной живым игроком, а такую может
+	// занять новый человек. См. nativeBot.
+	NativeAI bool
+	Defeated bool
+	Retired  bool
+	// LastLogin — когда игрок последний раз заходил в партию: то же, что
+	// игра показывает в окне дипломатии. Нулевое — не знаем или игра
+	// сама признала его неактивным (Inactive).
+	LastLogin time.Time
+	// Inactive — живой игрок, которого игра признала неактивным: она
+	// ставит ему lastLogin = 0 (LAST_LOGIN_INACTIVE у клиента).
+	Inactive bool
+	// Active — игра говорит «активен», но время входа скрывает: lastLogin
+	// = 1. Так она отдаёт всех, кроме нас самих, — и наблюдателю, и
+	// участнику (проверено 15.10.2026). Точное время знаем только своё.
+	Active bool
+}
+
+// Team — коалиция партии. Своё название и свой цвет игра даёт каждой,
+// поэтому придумывать их не приходится. Распущенные коалиции сюда
+// не попадают: игра держит их в списке, но состоять в них уже нельзя.
+type Team struct {
+	ID    int
+	Name  string
+	Color string
+}
+
+// GameState — то, что мы забрали с игрового сервера за один заход.
+type GameState struct {
+	GameID string
+	// MapID — какая карта под партией: по нему берутся очертания провинций.
+	MapID string
+	Day   int
+	// Anonymous — анонимный раунд: игра подменяет имена участников, а номера
+	// аккаунтов оставляет настоящими. То же, что Game.IsAnonymous у сайта.
+	Anonymous bool
+	Me        int // наш playerID в этой партии
+	Players   map[int]Player
+	// Teams — коалиции партии по своему номеру. Пусто, если коалиций
+	// в партии нет: игроки тогда все с TeamID = 0.
+	Teams     map[int]Team
+	Provinces []Province
+	Armies    []Army
+	// Relations — наше отношение к каждому игроку партии по его номеру,
+	// по шкале клиента (см. RelationRightOfWay). Отношение одностороннее,
+	// и здесь только то, что выдали мы. Нет записи — игра о нём не сказала.
+	Relations map[int]int
+	// HeroTypes — типы юнитов, умеющих призывать пехоту (роль
+	// DEPLOY_INFANTRY), и их имена: по ним ищется армия с героиней.
+	HeroTypes map[int]string
+	// Heroes — герои аккаунта, которых можно поставить на карту: предмет
+	// инвентаря на каждого. HeroLimit — сколько героев сценарий разрешает
+	// держать на карте разом; ноль — игра не сказала.
+	Heroes    []HeroItem
+	HeroLimit int
+	// Inventory — предметы аккаунта и сколько их: по ним считается
+	// уровень героя, см. HeroCard.Level.
+	Inventory map[int]int
+	// Upgrades — справочник зданий этой партии по номеру.
+	Upgrades map[int]Upgrade
+	// Resources — наши запасы по номеру ресурса. У наблюдателя пусто:
+	// чужие запасы игра не рассказывает.
+	Resources map[int]Resource
+	// Units — войска, которые вообще можно заказать, по номеру типа.
+	Units map[int]UnitType
+	// UnitSets — род войск каждого типа юнита, включая героев: 1 суша,
+	// 2 воздух, 3 море, 4 герои. По нему отличают сухопутную армию.
+	UnitSets map[int]int
+	// UnitNames и UnitUpkeep — имя и суточное содержание одного юнита
+	// любого типа, включая героев и непроизводимых: чужие армии бывают
+	// из чего угодно.
+	UnitNames  map[int]string
+	UnitUpkeep map[int]map[int]float64
+	// ResourceNames — названия ресурсов из справочника партии: они есть
+	// и у наблюдателя, в отличие от наших запасов.
+	ResourceNames map[int]string
+	// Consumption — потребление ресурса на душу населения в сутки
+	// («resourceConsumption»), StateFactor — множитель потребления по
+	// состоянию провинции. См. ProvinceUpkeep.
+	Consumption map[int]float64
+	StateFactor map[int]float64
+	// NextDay — следующая смена дня, настоящими часами. Только в неё игра
+	// пересчитывает очки и объявляет победителя, поэтому конец партии
+	// может прийтись лишь на неё. Нулевое — игра не сказала.
+	NextDay time.Time
+	// DayLength — сколько длится игровой день настоящими часами: сутки
+	// в обычной партии, меньше в ускоренной.
+	DayLength time.Duration
+	// Ended — партия кончилась: игра так и сказала или назвала победителя.
+	Ended bool
+	// Race — счёт партии: сколько очков у кого и сколько нужно для победы.
+	Race Race
+	// Speed — во сколько раз партия быстрее обычной: 1, 4, 10.
+	Speed float64
+	// DoubleThreshold — с какой базовой добычи провинция считается
+	// «двойной» (doubleResourceProductionThreshold, обычно 5000).
+	DoubleThreshold float64
+	// TheirRelations — отношение каждого игрока к нам (его строка
+	// neighborRelations). Вместе с Relations это обе стороны.
+	TheirRelations map[int]int
+	// Market — биржа и сделки с игроками.
+	Market Market
+	// UnitStats — боевые свойства каждого типа юнитов, включая чужих.
+	UnitStats map[int]UnitStat
+	// ServerTime — миг ответа игрового сервера настоящими часами.
+	ServerTime time.Time
+	// PeaceUntil и PeaceAIUntil — до какого мига в партии мирный период
+	// между людьми и с ботами: войну тогда объявить нельзя. Нулевое —
+	// мирного периода нет.
+	PeaceUntil, PeaceAIUntil time.Time
+	// HonorPeriod — в партии есть период чести: после объявления войны
+	// нападать можно не сразу, а с HonorEnd[игрок].
+	HonorPeriod bool
+	HonorEnd    map[int]time.Time
+}
+
+// Номера ресурсов, одинаковые во всех сценариях Supremacy 1914.
+const (
+	ResourceGrain = 0
+	ResourceFish  = 1
+	ResourceIron  = 2
+	ResourceWood  = 3
+	ResourceCoal  = 4
+	ResourceOil   = 5
+	ResourceGas   = 6
+	ResourceMoney = 20
+)
+
+// UnitStat — боевые свойства типа юнитов на одну единицу: сила атаки
+// и защиты, здоровье и общая оценка силы от самой игры (powerLevel).
+type UnitStat struct {
+	Name string
+	// Ident — имя типа у игры строчными буквами: «infantry», «car».
+	Ident    string
+	Set      int
+	Strength float64
+	Defence  float64
+	HP       float64
+	Power    float64
+}
+
+// Market — биржа (заявки на покупку и продажу, справочные цены) и прямые
+// сделки с игроками.
+type Market struct {
+	Asks   []Order // кто продаёт
+	Bids   []Order // кто покупает
+	Prices map[int]float64
+	// Incoming — предложения, которые ждут нашего ответа; Past — чем
+	// кончились прошлые сделки.
+	Incoming []TradeOffer
+	Past     []TradeOffer
+}
+
+// Order — заявка на бирже.
+type Order struct {
+	ID       int64
+	Buy      bool
+	Amount   float64
+	Limit    float64
+	Resource int
+	Player   int
+}
+
+// TradeOffer — сделка между двумя игроками: A отдаёт OffersA, B — OffersB.
+type TradeOffer struct {
+	ID         int64
+	PartyA     int
+	PartyB     int
+	OffersA    map[int]float64
+	OffersB    map[int]float64
+	Processed  bool
+	Successful bool
+	Time       time.Time
+}
+
+// Race — гонка за победными очками. Счёт обновляется при смене дня.
+type Race struct {
+	WinPoints     int         // порог победы одиночки
+	TeamWinPoints int         // порог победы коалиции
+	Points        map[int]int // номер игрока → очки
+	TeamPoints    map[int]int // номер коалиции → очки
+}
+
+// Finished — стоит ли здание в провинции полностью: есть и его состояние
+// кратно уровню. Недостроенное или повреждённое (у клиента — «Ремонт»)
+// готовым не считается: его ставят в стройку тем же действием.
+func (g *GameState) Finished(p Province, upgradeID int) bool {
+	c, ok := p.Condition[upgradeID]
+	if !ok || c <= 0 {
+		return false
+	}
+	bc := g.Upgrades[upgradeID].BuildCondition
+	if bc <= 0 {
+		bc = 2
+	}
+	return c%bc == 0
+}
+
+// Province возвращает провинцию по номеру.
+func (g *GameState) Province(id int) (Province, bool) {
+	for _, p := range g.Provinces {
+		if p.ID == id {
+			return p, true
+		}
+	}
+	return Province{}, false
+}
+
+// DeployArmy — наша армия с героиней, умеющей призыв пехоты. Пусто, если
+// такой армии в партии нет: героиню в партию ещё не отправили или её убили.
+// У наблюдателя своего игрока нет вовсе, и своей армии у него быть не может:
+// иначе за нас сошёл бы владелец с номером ноль.
+func (g *GameState) DeployArmy() (Army, string, bool) {
+	if g.Me <= 0 {
+		return Army{}, "", false
+	}
+	for _, a := range g.Armies {
+		if a.Owner != g.Me {
+			continue
+		}
+		for _, u := range a.Units {
+			if name, ok := g.HeroTypes[u.Type]; ok {
+				return a, name, true
+			}
+		}
+	}
+	return Army{}, "", false
+}
+
+// Owned возвращает провинции игрока в том порядке, в каком их отдала игра.
+func (g *GameState) Owned(playerID int) []Province {
+	var out []Province
+	for _, p := range g.Provinces {
+		if p.Owner == playerID {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// gameAccess — разовый пропуск на игровой сервер конкретной партии.
+type gameAccess struct {
+	host   string
+	auth   string
+	tstamp string
+}
+
+// GameState заходит в партию игроком и забирает её состояние целиком.
+// Такой заход игра засчитывает как вход в партию, и работает он только
+// там, где мы играем. Для чужой партии есть ObserveGame.
+func (c *Client) GameState(ctx context.Context, gameID string) (*GameState, error) {
+	_, state, err := c.enter(ctx, gameID)
+	return state, err
+}
+
+// ObserveGame забирает состояние партии наблюдателем: активацию мы
+// пропускаем, а с ней — и вход в партию. Игра отдаёт всё то же самое,
+// включая коалиции с их названиями и цветами, про любую партию, играем мы
+// в ней или нет; своего игрока в таком состоянии нет, поэтому Me = 0.
+func (c *Client) ObserveGame(ctx context.Context, gameID string) (*GameState, error) {
+	acc, err := c.gameAccess(ctx, gameID)
+	if err != nil {
+		return nil, err
+	}
+	return c.gameState(ctx, acc, gameID, 1, 0)
+}
+
+// enter проходит вход в партию и возвращает пропуск вместе с состоянием:
+// пропуск нужен тем, кто после этого шлёт команды.
+func (c *Client) enter(ctx context.Context, gameID string) (*gameAccess, *GameState, error) {
+	acc, err := c.gameAccess(ctx, gameID)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Активация выдаёт наш номер в партии; она же и есть тот самый вход,
+	// который игра запоминает.
+	var playerID int
+	if err := c.gsCall(ctx, acc, gameID, 1, "ultshared.action.UltActivateGameAction", 0, map[string]any{
+		"selectedPlayerID":              -1,
+		"selectedTeamID":                -1,
+		"randomTeamAndCountrySelection": false,
+		"os":                            "Linux ",
+		"device":                        "desktop",
+		"isMobileClient":                true,
+	}, &playerID); err != nil {
+		return nil, nil, err
+	}
+	if playerID <= 0 {
+		return nil, nil, fmt.Errorf("вход в партию %s: игра вернула playerID=%d (мы в ней не играем?)", gameID, playerID)
+	}
+
+	state, err := c.gameState(ctx, acc, gameID, 2, playerID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return acc, state, nil
+}
+
+// gameState спрашивает у игрового сервера полное состояние партии.
+// playerID = 0 означает «смотрим наблюдателем»: игра такой запрос принимает
+// и без активации, только своего игрока в ответе тогда нет.
+func (c *Client) gameState(ctx context.Context, acc *gameAccess, gameID string,
+	reqID, playerID int) (*GameState, error) {
+
+	var state gameStateResponse
+	if err := c.gsCall(ctx, acc, gameID, reqID, "ultshared.action.UltUpdateGameStateAction", playerID, map[string]any{
+		"actions": []any{map[string]any{
+			"requestID":  "actionReq-1",
+			"@c":         "ultshared.action.UltLoginAction",
+			"resolution": "1920x1080",
+			"sysInfos": map[string]any{
+				"@c":             "ultshared.action.UltSystemInfos",
+				"os":             "Linux ",
+				"device":         "desktop",
+				"browser":        "chrome",
+				"isMobileClient": true,
+				"assetQuality":   "high",
+				"mapQuality":     "high",
+				"gpuQuality":     "high",
+				"memoryQuality":  "high",
+				"source":         trackingSource,
+			},
+		}},
+		"lastCallDuration": 0,
+	}, &state); err != nil {
+		return nil, err
+	}
+	state.received = time.Now()
+
+	built, err := state.build(gameID, playerID)
+	if err != nil {
+		return nil, err
+	}
+	return built, nil
+}
+
+// gameAccess спрашивает у сайта, на каком сервере идёт партия и с каким
+// токеном туда пускают. Ответ — та же пачка параметров, которую сайт
+// подставляет в адрес клиента игры, поэтому берём из неё только нужное.
+func (c *Client) gameAccess(ctx context.Context, gameID string) (*gameAccess, error) {
+	raw, err := c.call(ctx, "getGameToken", []param{{"gameID", gameID}})
+	if err != nil {
+		return nil, err
+	}
+
+	var res struct {
+		Token struct {
+			GS     string `json:"gs"`
+			Auth   string `json:"auth"`
+			Tstamp string `json:"authTstamp"`
+		} `json:"token"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return nil, fmt.Errorf("разбор токена партии: %w", err)
+	}
+	if res.Token.GS == "" || res.Token.Auth == "" {
+		return nil, fmt.Errorf("в токене партии %s нет адреса сервера или ключа", gameID)
+	}
+	return &gameAccess{host: res.Token.GS, auth: res.Token.Auth, tstamp: res.Token.Tstamp}, nil
+}
+
+// gsCall отправляет одно действие игровому серверу и разбирает поле result.
+// Общие поля запроса игра требует в каждом действии, поэтому они собираются
+// здесь, а вызывающий добавляет только своё.
+func (c *Client) gsCall(ctx context.Context, acc *gameAccess, gameID string, reqID int,
+	class string, playerID int, extra map[string]any, out any) error {
+
+	// Вторая попытка нужна ровно на один случай: игра сказала, какой версией
+	// клиента с ней теперь разговаривают. Запоминаем её и повторяем запрос.
+	for attempt := 0; ; attempt++ {
+		raw, err := c.gsSend(ctx, acc, gameID, reqID, class, playerID, extra)
+		if err != nil {
+			return err
+		}
+
+		var exc struct {
+			Class  string `json:"@c"`
+			Detail string `json:"detailMessage"`
+		}
+		if json.Unmarshal(raw, &exc) == nil && strings.HasSuffix(exc.Class, "Exception") {
+			e := &gsException{class: exc.Class, detail: exc.Detail}
+			if v := e.version(); v != "" && attempt == 0 {
+				c.log.Warn("игровой сервер ждёт другую версию клиента", "версия", v)
+				c.setGameVersion(v)
+				continue
+			}
+			return fmt.Errorf("%s: %w", class, e)
+		}
+
+		if err := json.Unmarshal(raw, out); err != nil {
+			return fmt.Errorf("%s: разбор ответа: %w", class, err)
+		}
+		return nil
+	}
+}
+
+// gsSend отправляет одно действие и возвращает поле result как есть.
+// Общие поля запроса игра требует в каждом действии, поэтому они собираются
+// здесь, а вызывающий добавляет только своё.
+func (c *Client) gsSend(ctx context.Context, acc *gameAccess, gameID string, reqID int,
+	class string, playerID int, extra map[string]any) (json.RawMessage, error) {
+
+	body := map[string]any{
+		"requestID":  reqID,
+		"@c":         class,
+		"version":    c.gameVersion(),
+		"client":     gsClient,
+		"siteUserID": numeric(c.UserID()),
+		"adminLevel": 0,
+		"gameID":     numeric(gameID),
+		"playerID":   playerID,
+		"rights":     "chat",
+		"userAuth":   acc.auth,
+		"tstamp":     acc.tstamp,
+	}
+	for k, v := range extra {
+		body[k] = v
+	}
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		"https://"+acc.host+"/", strings.NewReader(string(payload)))
+	if err != nil {
+		return nil, err
+	}
+	// Клиент игры ходит сюда именно так: тело — JSON, а тип заявлен формой.
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	req.Header.Set("Origin", baseURL)
+	req.Header.Set("Referer", baseURL+"/")
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", class, err)
+	}
+	defer resp.Body.Close()
+
+	// Состояние партии — это мегабайты, поэтому лимит здесь щедрее обычного.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if err != nil {
+		return nil, fmt.Errorf("%s: чтение ответа: %w", class, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, &APIError{Action: class, Status: resp.StatusCode}
+	}
+
+	var env struct {
+		Result json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, &APIError{Action: class, Malformed: true, Message: err.Error()}
+	}
+	if len(env.Result) == 0 {
+		return nil, &APIError{Action: class, Malformed: true, Message: "в ответе нет поля result"}
+	}
+	return env.Result, nil
+}
+
+// gameStateResponse — только те части состояния, которые нам нужны.
+// Ключи состояний игра нумерует: 1 — игроки, 3 — карта, 12 — общая информация.
+type gameStateResponse struct {
+	// TimeStamp — часы игрового сервера на момент ответа. По ним считается
+	// остаток размещения: сравнивать с нашими часами нельзя, игровое время
+	// идёт быстрее.
+	TimeStamp string `json:"timeStamp"`
+	// received — наши часы в миг ответа. Вместе с TimeStamp и началом
+	// партии по ним узнаётся её скорость (см. gameClock). Ноль — часы
+	// не известны, и время партии берётся как есть.
+	received time.Time
+	States   struct {
+		Players struct {
+			Players map[string]struct {
+				PlayerID   int    `json:"playerID"`
+				NationName string `json:"nationName"`
+				Color      string `json:"primaryColor"`
+				UserName   string `json:"userName"`
+				SiteUserID int64  `json:"siteUserID"`
+				CapitalID  int    `json:"capitalID"`
+				TeamID     int    `json:"teamID"`
+				Premium    bool   `json:"premiumUser"`
+				Banned     bool   `json:"banned"`
+				IsAI       bool   `json:"computerPlayer"`
+				// nativeComputer — бот с начала партии, а не брошенная
+				// страна. Указатель: нет поля — не знаем.
+				Native *bool `json:"nativeComputer"`
+				// lastLogin — миллисекунды настоящего времени (клиент
+				// показывает его как new Date(lastLogin)); 0 у ботов и у тех,
+				// кого игра признала неактивным. Указатель: нет поля — не знаем.
+				LastLogin *float64 `json:"lastLogin"`
+				Defeated  bool     `json:"defeated"`
+				Retired   bool     `json:"retired"`
+			} `json:"players"`
+			// Коалиции лежат рядом с игроками: у игрока только номер
+			// коалиции, а название, цвет и роспуск — здесь.
+			Teams map[string]struct {
+				TeamID    int    `json:"teamID"`
+				Name      string `json:"name"`
+				Color     string `json:"primaryColor"`
+				Disbanded bool   `json:"disbanded"`
+			} `json:"teams"`
+		} `json:"1"`
+		Map struct {
+			Map struct {
+				MapID     string `json:"mapID"`
+				Locations []struct {
+					Class  string   `json:"@c"`
+					ID     int      `json:"id"`
+					Name   string   `json:"n"`
+					Owner  *int     `json:"o"`
+					Morale *float64 `json:"m"`
+					// us — построенные здания, cos — список идущих строек,
+					// bi — первая из них же. Читаем список: со вторым
+					// слотом (премиум) строек бывает две, и в bi лежит
+					// только одна.
+					Built []struct {
+						ID        int  `json:"id"`
+						Condition int  `json:"c"`
+						Enabled   bool `json:"e"`
+					} `json:"us"`
+					Constructions json.RawMessage `json:"cos"`
+					Building      *buildWire      `json:"bi"`
+					Slots         int             `json:"cs"`
+					// prs — идущее производство войск тем же особым
+					// списком, что и стройки; ps — слотов под него.
+					Productions json.RawMessage `json:"prs"`
+					ProdSlots   int             `json:"ps"`
+					// arp — суточная добыча по ресурсам, p — население,
+					// pst — состояние провинции. Сырыми: формат не наш,
+					// и сломанное поле не должно ронять всё состояние.
+					Output     json.RawMessage `json:"arp"`
+					Population *float64        `json:"p"`
+					StateID    int             `json:"pst"`
+					MaxOutput  json.RawMessage `json:"mpm"`
+					Configured json.RawMessage `json:"cp"`
+					Cores      []int           `json:"ci"`
+					Legal      *int            `json:"lo"`
+					VP         int             `json:"vp"`
+				} `json:"locations"`
+			} `json:"map"`
+			// properties — что можно делать в своих провинциях. Решает это
+			// игра, а не мы: possibleProductions — войска, которые можно
+			// начать прямо сейчас, в том самом виде («su»), в каком клиент
+			// отправляет их в заказ. Пока производство занято, этот список
+			// пуст, а те же войска лежат в queueableProductions (проверено
+			// на 10909474: у Сурселе с идущим бронеавтомобилем так и было).
+			Properties map[string]struct {
+				Productions []json.RawMessage `json:"possibleProductions"`
+				Queueable   []json.RawMessage `json:"queueableProductions"`
+			} `json:"properties"`
+		} `json:"3"`
+		Armies struct {
+			Armies map[string]struct {
+				ID       int64 `json:"id"`
+				Owner    *int  `json:"o"`
+				Size     int   `json:"s"`
+				Location int   `json:"l"`
+				Units    []struct {
+					Type  int       `json:"t"`
+					Size  int       `json:"s"`
+					Names *[]string `json:"n"`
+				} `json:"u"`
+				Pos MapPoint `json:"p"`
+				// rm — армии уже нет: игра держит её в списке до конца хода.
+				Removed  bool `json:"rm"`
+				Commands []struct {
+					Class    string    `json:"@c"`
+					ExecTime int64     `json:"execTime"`
+					Target   *MapPoint `json:"tp"`
+				} `json:"c"`
+				AttackTarget int64 `json:"au"`
+				// fs — fightStatus клиента: 0 покой, 1 бой, 2 обстрел,
+				// 3 патруль, 4 выход на патруль, 5 осада, 6 отступление.
+				FightStatus int `json:"fs"`
+				// b — бой, в котором армия участвует; a — кто на неё напал.
+				Battle *struct {
+					Attackers []json.RawMessage `json:"a"`
+				} `json:"b"`
+			} `json:"armies"`
+		} `json:"6"`
+		Mod struct {
+			// allUnitTypes — полный справочник; unitTypes в партии урезан
+			// и героини в нём может не быть.
+			AllUnitTypes map[string]struct {
+				UnitTypeID int    `json:"unitTypeId"`
+				UnitName   string `json:"unitName"`
+				// identifier — имя типа у игры («Car»); по нему же названа
+				// картинка, только строчными буквами.
+				Identifier string             `json:"identifier"`
+				Costs      map[string]float64 `json:"costs"`
+				Producible bool               `json:"producible"`
+				// dailyCosts — содержание одного юнита в сутки.
+				DailyCosts json.RawMessage `json:"dailyCosts"`
+				// set — род войск: 1 суша, 2 воздух, 3 море, 4 герои.
+				Set          int `json:"set"`
+				RatingConfig struct {
+					UnitRoles  []string `json:"unitRoles"`
+					PowerLevel float64  `json:"powerLevel"`
+				} `json:"ratingConfig"`
+				Strength  map[string]float64 `json:"strength"`
+				Defence   map[string]float64 `json:"defence"`
+				HitPoints map[string]float64 `json:"hitPoints"`
+			} `json:"allUnitTypes"`
+			// upgrades — здания партии: название на языке аккаунта (upn),
+			// время стройки в секундах (bt) и цена по ресурсам (c).
+			Upgrades map[string]struct {
+				ID        int                `json:"id"`
+				Name      string             `json:"upn"`
+				BuildTime int                `json:"bt"`
+				BuildCond int                `json:"bc"`
+				Cost      map[string]float64 `json:"c"`
+				// ru — здание, которое это заменяет собой: так игра
+				// связывает уровни одного и того же здания.
+				Replaces flexInt `json:"ru"`
+				// ap — имя здания у игры («railway»); по нему названа картинка.
+				Image string `json:"ap"`
+				// doa — день, с которого здание можно строить.
+				Available flexInt `json:"doa"`
+				// dc — содержание в сутки, mxc — полное состояние.
+				DailyCosts   json.RawMessage `json:"dc"`
+				MaxCondition int             `json:"mxc"`
+			} `json:"upgrades"`
+			// Ресурсы партии с названиями, потребление на душу и состояния
+			// провинций: всё сырым, по той же причине, что и arp.
+			ResourceEntries     json.RawMessage `json:"resourceEntries"`
+			ResourceConsumption json.RawMessage `json:"resourceConsumption"`
+			ProvinceStates      json.RawMessage `json:"provinceStates"`
+			// Герои как предметы инвентаря: тип юнита героя → предмет,
+			// который его ставит на карту, и названия предметов.
+			HeroItems map[string]struct {
+				Item int `json:"identifier"`
+			} `json:"unitItemIdToPermanentPremiumItemId"`
+			Premiums map[string]struct {
+				Name string `json:"name"`
+			} `json:"premiums"`
+		} `json:"11"`
+		// Инвентарь аккаунта: сколько каких предметов есть.
+		Inventory struct {
+			Items map[string]struct {
+				ID     int `json:"itemID"`
+				Amount int `json:"itemAmount"`
+			} `json:"inventory"`
+		} `json:"16"`
+		// Сценарий: сколько героев можно держать на карте разом.
+		Scenario struct {
+			Heroes struct {
+				Limit int `json:"limit"`
+			} `json:"heroConfig"`
+			DoubleThreshold float64 `json:"doubleResourceProductionThreshold"`
+		} `json:"31"`
+		// Ресурсы: запас на момент time0 и прирост в секунду. Лежат они
+		// по игрокам, но чужие профили игра не наполняет — берём свой.
+		Resources struct {
+			Profiles map[string]struct {
+				Categories map[string]struct {
+					Entries map[string]struct {
+						ID       int     `json:"resourceID"`
+						Name     string  `json:"name"`
+						Amount   float64 `json:"amount0"`
+						Measured int64   `json:"time0"`
+						Rate     float64 `json:"rate"`
+					} `json:"resourceEntries"`
+				} `json:"categories"`
+			} `json:"resourceProfs"`
+			// asks и bids — по списку на ресурс в особом виде
+			// ["ultshared.UltAskList",[заявки]]; prices — справочная цена.
+			Asks    []json.RawMessage `json:"asks"`
+			Bids    []json.RawMessage `json:"bids"`
+			Prices  []float64         `json:"prices"`
+			Trading struct {
+				Offers []tradeWire `json:"tradingOffers"`
+				Past   []tradeWire `json:"pastTrades"`
+			} `json:"trading"`
+		} `json:"4"`
+		Info struct {
+			DayOfGame int `json:"dayOfGame"`
+			// timeScale — 1 у обычной партии, 0.25 у x4: игра сама говорит,
+			// во сколько раз её время быстрее.
+			TimeScale       float64 `json:"timeScale"`
+			DoubleThreshold float64 `json:"doubleResourceProductionThreshold"`
+			// StartOfGame — начало партии, в секундах. Это настоящее время:
+			// от него игровые часы и начинают бежать быстрее.
+			StartOfGame int64 `json:"startOfGame"`
+			// nextDayTime — следующая смена дня по игровым часам. Только
+			// в неё игра пересчитывает очки и объявляет победу.
+			NextDayTime int64 `json:"nextDayTime"`
+			EndOfGame   bool  `json:"endOfGame"`
+			// Пороги победы: одиночке и коалиции.
+			VictoryPoints     int `json:"victoryPoints"`
+			TeamVictoryPoints int `json:"teamVictoryPoints"`
+			// Свойства партии: клиент игры узнаёт анонимный раунд именно
+			// отсюда, по включённой фиче с номером featureAnonymous.
+			GameFeatures struct {
+				IDFeatures map[string]struct {
+					Enabled bool    `json:"enabled"`
+					Value   float64 `json:"value"`
+				} `json:"idFeatures"`
+			} `json:"gameFeatures"`
+		} `json:"12"`
+		// Газета: в ней же счёт партии — очки каждого игрока (номер игрока —
+		// индекс в ranking) и каждой коалиции, и победитель, если он есть.
+		// Наблюдателю она приходит так же, как игроку.
+		Newspaper struct {
+			Ranking struct {
+				Ranking     []int          `json:"ranking"`
+				TeamRanking map[string]int `json:"teamRanking"`
+				Winner      int            `json:"winner"`
+				WinnerTeam  int            `json:"winnerTeam"`
+			} `json:"ranking"`
+		} `json:"2"`
+		// Дипломатия (UltForeignAffairsState): neighborRelations[кто][кому].
+		// Обе таблицы — java-мапы со служебным ключом «@c», поэтому
+		// разбираются вручную, см. relationsOf.
+		ForeignAffairs struct {
+			Relations struct {
+				Neighbor map[string]json.RawMessage `json:"neighborRelations"`
+				// endOfHonorPeriod[кто][кому] — до какого мига после объявления
+				// войны нападать нельзя (период чести).
+				Honor map[string]json.RawMessage `json:"endOfHonorPeriod"`
+			} `json:"relations"`
+		} `json:"5"`
+	} `json:"states"`
+}
+
+const (
+	// provinceLand — суша; «sp» в тех же списках означает море.
+	provinceLand = "p"
+
+	// roleDeployInfantry — роль юнита, который умеет призывать пехоту.
+	// Так игра помечает Мейв; фичи DEPLOY_UNIT у её типа при этом нет.
+	roleDeployInfantry = "DEPLOY_INFANTRY"
+
+	// commandDeployWait — команда «идёт размещение»: игра ставит её армии
+	// на всё время призыва.
+	commandDeployWait = "dwc"
+
+	// lastLoginReal — с какого значения lastLogin это время, а не метка:
+	// 1 января 2000-го в миллисекундах. Меньше — метки игры (0 и 1).
+	lastLoginReal = 946684800000
+
+	// commandGoto — отрезок марша: армия идёт из sp в tp. Приказ идти
+	// далеко — это цепочка таких отрезков по графу дорог карты.
+	commandGoto = "gc"
+
+	// unitSetHero — род войск «герои» в справочнике юнитов.
+	unitSetHero = 4
+
+	// featureAnonymous — номер фичи «анонимный раунд» в свойствах партии
+	// (FEATURE_ANONYMOUS в клиенте игры).
+	featureAnonymous = "6"
+	// Мирный период между людьми, с ботами и период чести
+	// (IR_PEACEPERIOD, IR_PEACEPERIOD_AI, IR_HONORPERIOD у клиента).
+	featurePeace   = "2"
+	featurePeaceAI = "3"
+	featureHonor   = "4"
+)
+
+// build превращает ответ игры в наш вид. Провинции без владельца пропускаем:
+// это нейтральные земли и вода, а нас интересует, кто чем владеет.
+func (r *gameStateResponse) build(gameID string, me int) (*GameState, error) {
+	locations := r.States.Map.Map.Locations
+	if len(locations) == 0 {
+		return nil, fmt.Errorf("партия %s: игра не прислала карту", gameID)
+	}
+
+	// Часы сервера приходят строкой; без них остаток размещения не посчитать,
+	// но и повода отказываться от всего состояния в этом нет.
+	serverNow, _ := strconv.ParseInt(r.TimeStamp, 10, 64)
+	clock := newGameClock(r.States.Info.StartOfGame, serverNow, r.received)
+	if ts := r.States.Info.TimeScale; ts > 0 && ts <= 1 {
+		clock.scale = ts
+	}
+
+	g := &GameState{
+		GameID: gameID,
+		MapID:  r.States.Map.Map.MapID,
+		Day:    r.States.Info.DayOfGame,
+		// Анонимность — то же свойство, что сайт отдаёт как anonymousRound,
+		// но приходит оно с самой партией, и ждать сайт ради него не нужно.
+		Anonymous: r.States.Info.GameFeatures.IDFeatures[featureAnonymous].Enabled,
+		Me:        me,
+		Players:   make(map[int]Player, len(r.States.Players.Players)),
+	}
+
+	// Распущенные коалиции пропускаем: игра оставляет их в списке, но
+	// состоять в них уже нельзя, и на карте им делать нечего.
+	for _, t := range r.States.Players.Teams {
+		if t.TeamID <= 0 || t.Disbanded {
+			continue
+		}
+		if g.Teams == nil {
+			g.Teams = make(map[int]Team, len(r.States.Players.Teams))
+		}
+		g.Teams[t.TeamID] = Team{ID: t.TeamID, Name: t.Name, Color: cssColor(t.Color)}
+	}
+
+	capitals := make(map[int]bool)
+	for _, p := range r.States.Players.Players {
+		// Игра держит в этом списке и служебного игрока -1 («никто»).
+		if p.PlayerID <= 0 {
+			continue
+		}
+		player := Player{
+			ID: p.PlayerID, Nation: p.NationName, Name: p.UserName,
+			Color: cssColor(p.Color), TeamID: p.TeamID, Premium: p.Premium, Banned: p.Banned,
+			IsAI: p.IsAI, Defeated: p.Defeated, Retired: p.Retired,
+			NativeAI: nativeBot(p.IsAI, p.Native, p.SiteUserID),
+		}
+		if p.LastLogin != nil {
+			switch ms := int64(*p.LastLogin); {
+			case ms >= lastLoginReal:
+				player.LastLogin = time.UnixMilli(ms)
+			case ms > 0:
+				// Метка «активен» вместо времени: принять её за время
+				// значило бы вход в 1970-м и «давно не заходил» у всех.
+				player.Active = !p.IsAI
+			case !p.IsAI:
+				player.Inactive = true
+			}
+		}
+		// У ботов номера на сайте нет — там ноль, и в базе его искать незачем.
+		if p.SiteUserID > 0 {
+			player.SiteUserID = strconv.FormatInt(p.SiteUserID, 10)
+		}
+		g.Players[p.PlayerID] = player
+		if p.CapitalID > 0 {
+			capitals[p.CapitalID] = true
+		}
+	}
+
+	// Ноль у всех живых игроков разом — не «все бросили партию», а «игра
+	// времени входа не сказала»: неактивными тогда не помечаем никого.
+	anyLogin := false
+	for _, pl := range g.Players {
+		if !pl.LastLogin.IsZero() || pl.Active {
+			anyLogin = true
+			break
+		}
+	}
+	if !anyLogin {
+		for id, pl := range g.Players {
+			pl.Inactive = false
+			g.Players[id] = pl
+		}
+	}
+
+	for _, l := range locations {
+		// «p» — суша, «sp» — море. Ничейную сушу тоже берём: без неё карту
+		// не нарисовать, а Owner = 0 честно означает «ничья».
+		if l.Class != provinceLand {
+			continue
+		}
+		pr := Province{ID: l.ID, Name: l.Name, Capital: capitals[l.ID], Slots: l.Slots}
+		if l.Owner != nil {
+			pr.Owner = *l.Owner
+		}
+		if l.Morale != nil {
+			pr.Morale = *l.Morale
+		}
+		for _, b := range l.Built {
+			if b.ID > 0 {
+				pr.Built = append(pr.Built, b.ID)
+				if pr.Condition == nil {
+					pr.Condition = make(map[int]int, len(l.Built))
+					pr.Enabled = make(map[int]bool, len(l.Built))
+				}
+				pr.Condition[b.ID] = b.Condition
+				pr.Enabled[b.ID] = b.Enabled
+			}
+		}
+		pr.MaxOutput = numMap(l.MaxOutput)
+		pr.Configured = numMap(l.Configured)
+		pr.Cores = l.Cores
+		pr.VictoryPoints = l.VP
+		if l.Legal != nil {
+			pr.LegalOwner = *l.Legal
+		}
+		for _, c := range buildList(l.Constructions, l.Building, clock) {
+			pr.Building = append(pr.Building, c)
+		}
+		pr.Producing = productionList(l.Productions, clock)
+		pr.ProdSlots = l.ProdSlots
+		pr.Output = numMap(l.Output)
+		pr.Population = 1e5 // так же, как клиент игры, если поля нет
+		if l.Population != nil {
+			pr.Population = *l.Population
+		}
+		pr.StateID = l.StateID
+		if props, ok := r.States.Map.Properties[strconv.Itoa(l.ID)]; ok {
+			// Сначала «можно поставить в очередь», поверх — «можно начать»:
+			// в заказ уходит запись из второго списка, когда он есть.
+			pr.CanProduce = possibleUnits(append(append([]json.RawMessage{}, props.Queueable...), props.Productions...))
+		}
+		g.Provinces = append(g.Provinces, pr)
+	}
+
+	g.Upgrades = make(map[int]Upgrade, len(r.States.Mod.Upgrades))
+	for _, u := range r.States.Mod.Upgrades {
+		if u.ID <= 0 {
+			continue
+		}
+		up := Upgrade{ID: u.ID, Name: u.Name, Replaces: int(u.Replaces), Image: strings.ToLower(u.Image),
+			Build:          clock.duration(time.Duration(u.BuildTime) * time.Second),
+			BuildCondition: u.BuildCond, Available: int(u.Available),
+			DailyCosts: numMap(u.DailyCosts), MaxCondition: u.MaxCondition}
+		// Так же, как клиент игры: без «bc» уровень стоит 2, без «doa»
+		// здание доступно с первого дня.
+		if up.BuildCondition <= 0 {
+			up.BuildCondition = 2
+		}
+		if up.Available <= 0 {
+			up.Available = 1
+		}
+		if len(u.Cost) > 0 {
+			up.Cost = make(map[int]float64, len(u.Cost))
+			for id, amount := range u.Cost {
+				if n, err := strconv.Atoi(id); err == nil {
+					up.Cost[n] = amount
+				}
+			}
+		}
+		g.Upgrades[u.ID] = up
+	}
+
+	// Уровни считаются после того, как собран весь справочник: цепочка
+	// «второй заменяет первый» ведёт к зданию, которого в списке могло
+	// ещё не быть.
+	for id, u := range g.Upgrades {
+		u.Tier = upgradeTier(g.Upgrades, id, 0)
+		g.Upgrades[id] = u
+	}
+
+	// Запасы — только свои: в чужих профилях игра ресурсы не присылает.
+	if profile, ok := r.States.Resources.Profiles[strconv.Itoa(me)]; ok && me > 0 {
+		g.Resources = make(map[int]Resource)
+		for _, category := range profile.Categories {
+			for _, e := range category.Entries {
+				g.Resources[e.ID] = Resource{
+					ID: e.ID, Name: e.Name, Amount: e.Amount,
+					Measured: clock.real(e.Measured), Rate: e.Rate / clock.scale,
+					Daily: e.Rate * 24 * 60 * 60,
+				}
+			}
+		}
+	}
+
+	if me > 0 {
+		g.Relations = relationsOf(r.States.ForeignAffairs.Relations.Neighbor[strconv.Itoa(me)])
+		g.TheirRelations = make(map[int]int)
+		for k, row := range r.States.ForeignAffairs.Relations.Neighbor {
+			id, err := strconv.Atoi(k)
+			if err != nil || id <= 0 || id == me {
+				continue
+			}
+			if rel, ok := relationsOf(row)[me]; ok {
+				g.TheirRelations[id] = rel
+			}
+		}
+		g.Market = r.market(me, clock)
+	}
+
+	mod := r.States.Mod
+	g.ResourceNames = resourceNames(mod.ResourceEntries)
+	g.Consumption = numMap(mod.ResourceConsumption)
+	g.StateFactor = stateFactors(mod.ProvinceStates)
+
+	// Герой есть у аккаунта, когда его предмет лежит в инвентаре. Предмет
+	// постоянный: размещение его не тратит, и на карту герой встаёт один.
+	owned := make(map[int]int, len(r.States.Inventory.Items))
+	for _, it := range r.States.Inventory.Items {
+		owned[it.ID] = it.Amount
+	}
+	g.Inventory = owned
+	for unit, h := range mod.HeroItems {
+		unitID, err := strconv.Atoi(unit)
+		if err != nil || owned[h.Item] <= 0 {
+			continue
+		}
+		g.Heroes = append(g.Heroes, HeroItem{
+			Unit: unitID, Item: h.Item, Name: mod.Premiums[strconv.Itoa(h.Item)].Name})
+	}
+	sort.Slice(g.Heroes, func(i, j int) bool { return g.Heroes[i].Name < g.Heroes[j].Name })
+	g.HeroLimit = r.States.Scenario.Heroes.Limit
+
+	g.HeroTypes = make(map[int]string)
+	g.Units = make(map[int]UnitType)
+	g.UnitNames = make(map[int]string)
+	g.UnitSets = make(map[int]int)
+	g.UnitUpkeep = make(map[int]map[int]float64)
+	g.UnitStats = make(map[int]UnitStat)
+	for _, u := range r.States.Mod.AllUnitTypes {
+		if u.UnitTypeID > 0 {
+			g.UnitStats[u.UnitTypeID] = UnitStat{Name: u.UnitName, Set: u.Set, Ident: strings.ToLower(u.Identifier),
+				Strength: maxValue(u.Strength), Defence: maxValue(u.Defence),
+				HP: maxValue(u.HitPoints), Power: u.RatingConfig.PowerLevel}
+			g.UnitNames[u.UnitTypeID] = u.UnitName
+			g.UnitSets[u.UnitTypeID] = u.Set
+			if costs := numMap(u.DailyCosts); len(costs) > 0 {
+				g.UnitUpkeep[u.UnitTypeID] = costs
+			}
+		}
+		// Заказать можно только то, что игра называет производимым;
+		// героев (set 4) она даёт отдельно, даже если флаг стоит.
+		if u.Producible && u.Set != unitSetHero && u.UnitTypeID > 0 {
+			unit := UnitType{ID: u.UnitTypeID, Name: u.UnitName,
+				Image: strings.ToLower(u.Identifier), Set: u.Set, Cost: map[int]float64{}}
+			for id, amount := range u.Costs {
+				if n, err := strconv.Atoi(id); err == nil {
+					unit.Cost[n] = amount
+				}
+			}
+			g.Units[unit.ID] = unit
+		}
+		for _, role := range u.RatingConfig.UnitRoles {
+			if role == roleDeployInfantry {
+				g.HeroTypes[u.UnitTypeID] = u.UnitName
+			}
+		}
+	}
+
+	for _, a := range r.States.Armies.Armies {
+		if a.Owner == nil || *a.Owner <= 0 || a.Removed {
+			continue
+		}
+		army := Army{ID: a.ID, Owner: *a.Owner, Size: a.Size, Location: a.Location, Pos: a.Pos,
+			AttackTarget: a.AttackTarget, Commands: len(a.Commands),
+			Fighting: a.FightStatus != 0 || (a.Battle != nil && len(a.Battle.Attackers) > 0)}
+		for _, u := range a.Units {
+			army.Units = append(army.Units, ArmyUnit{Type: u.Type, Size: u.Size, HasNames: u.Names != nil})
+		}
+		for _, cmd := range a.Commands {
+			if cmd.Class == commandGoto && cmd.Target != nil {
+				target := *cmd.Target
+				army.MarchTo = &target
+			}
+			if cmd.Class != commandDeployWait {
+				continue
+			}
+			army.Deploying = true
+			if left := cmd.ExecTime - serverNow; serverNow > 0 && left > 0 {
+				army.DeployLeft = clock.duration(time.Duration(left) * time.Millisecond)
+			}
+		}
+		g.Armies = append(g.Armies, army)
+	}
+	info, paper := r.States.Info, r.States.Newspaper.Ranking
+	g.DayLength = clock.duration(24 * time.Hour)
+	g.Speed = math.Round(1 / clock.scale)
+	// Мирные периоды: фичи 2 (между людьми) и 3 (с ботами), значение —
+	// секунды от начала партии (isPeacePeriod у клиента).
+	features := info.GameFeatures.IDFeatures
+	peace := func(id string) time.Time {
+		f, ok := features[id]
+		if !ok || !f.Enabled || f.Value <= 0 || info.StartOfGame <= 0 {
+			return time.Time{}
+		}
+		return time.Unix(info.StartOfGame, 0).Add(time.Duration(f.Value) * time.Second)
+	}
+	g.PeaceUntil, g.PeaceAIUntil = peace(featurePeace), peace(featurePeaceAI)
+	g.HonorPeriod = features[featureHonor].Enabled
+	if me > 0 {
+		g.HonorEnd = map[int]time.Time{}
+		add := func(row json.RawMessage) {
+			for id, ms := range relationsOf(row) {
+				if ms > 0 {
+					at := clock.real(int64(ms))
+					if old, ok := g.HonorEnd[id]; !ok || at.After(old) {
+						g.HonorEnd[id] = at
+					}
+				}
+			}
+		}
+		add(r.States.ForeignAffairs.Relations.Honor[strconv.Itoa(me)])
+		for k, row := range r.States.ForeignAffairs.Relations.Honor {
+			if id, err := strconv.Atoi(k); err == nil && id != me {
+				if ms, ok := relationsOf(row)[me]; ok && ms > 0 {
+					at := clock.real(int64(ms))
+					if old, ok := g.HonorEnd[id]; !ok || at.After(old) {
+						g.HonorEnd[id] = at
+					}
+				}
+			}
+		}
+	}
+	if serverNow > 0 {
+		g.ServerTime = clock.real(serverNow)
+	}
+	g.DoubleThreshold = r.States.Scenario.DoubleThreshold
+	if g.DoubleThreshold <= 0 {
+		g.DoubleThreshold = info.DoubleThreshold
+	}
+	if g.DoubleThreshold <= 0 {
+		g.DoubleThreshold = 5000
+	}
+	if info.NextDayTime > 0 {
+		g.NextDay = clock.real(info.NextDayTime)
+	}
+	g.Ended = info.EndOfGame || paper.Winner > 0 || paper.WinnerTeam > 0
+	g.Race = Race{
+		WinPoints: info.VictoryPoints, TeamWinPoints: info.TeamVictoryPoints,
+		Points: map[int]int{}, TeamPoints: map[int]int{},
+	}
+	for id, points := range paper.Ranking {
+		if id > 0 && points > 0 {
+			g.Race.Points[id] = points
+		}
+	}
+	for id, points := range paper.TeamRanking {
+		if n, err := strconv.Atoi(id); err == nil && n > 0 && points > 0 {
+			g.Race.TeamPoints[n] = points
+		}
+	}
+	return g, nil
+}
+
+// upgradeTier — какой это уровень здания: первый, если оно ничего
+// не заменяет, иначе на единицу выше заменяемого. depth страхует от
+// кольца в данных: справочник приходит от игры, и проверять его нам нечем.
+func upgradeTier(all map[int]Upgrade, id, depth int) int {
+	u, ok := all[id]
+	if !ok || u.Replaces == 0 || depth > 10 {
+		return 1
+	}
+	return upgradeTier(all, u.Replaces, depth+1) + 1
+}
+
+// flexInt — число, которое игра шлёт то числом, то строкой. Чужой формат
+// молча считаем нулём: из-за одного поля терять всё состояние партии
+// нельзя, а без уровня здания список лишь станет менее внятным.
+type flexInt int
+
+func (f *flexInt) UnmarshalJSON(b []byte) error {
+	text := strings.Trim(string(b), `"`)
+	if n, err := strconv.Atoi(text); err == nil {
+		*f = flexInt(n)
+		return nil
+	}
+	// Бывает и дробной записью: день доступности здания приходит как
+	// «"doa":3.0».
+	if x, err := strconv.ParseFloat(text, 64); err == nil {
+		*f = flexInt(x)
+	}
+	return nil
+}
+
+// CSSColor — то же, что cssColor, для цветов, которые приходят не с игрового
+// сервера, а из клиента игры в браузере (расширение Chrome): формат у них
+// тот же самый.
+func CSSColor(c string) string { return cssColor(c) }
+
+// cssColor переводит цвет страны из игрового «rgba(230,190,140,255)»
+// в то, что понимает браузер. Непрозрачность игра всегда шлёт полной,
+// поэтому четвёртый компонент отбрасываем.
+func cssColor(c string) string {
+	inside, ok := strings.CutPrefix(c, "rgba(")
+	if !ok {
+		return ""
+	}
+	inside, ok = strings.CutSuffix(inside, ")")
+	if !ok {
+		return ""
+	}
+	parts := strings.Split(inside, ",")
+	if len(parts) < 3 {
+		return ""
+	}
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return "rgb(" + strings.Join(parts[:3], ",") + ")"
+}
+
+// numeric приводит числовые идентификаторы, которые сайт отдаёт строками,
+// к числам: игровой сервер ждёт именно числа.
+func numeric(s string) int64 {
+	n, _ := strconv.ParseInt(s, 10, 64)
+	return n
+}
+
+// gameClock переводит время партии в настоящее. В ускоренной партии
+// (×2, ×4, …) игра отдаёт все сроки — конец стройки, замер запасов —
+// по своим часам, которые от начала партии бегут во столько же раз
+// быстрее. Клиент игры считает так же (getRealTime):
+// настоящее = начало + (игровое − начало) · scale.
+//
+// Сам масштаб в состоянии не приходит, но выводится из него: игровые
+// часы в миг ответа ушли от начала во столько раз дальше наших. Скорости
+// у партий целые, поэтому отношение округляется — неточность наших часов
+// на несколько секунд его не сбивает уже через минуту после старта.
+type gameClock struct {
+	start time.Time // начало партии
+	scale float64   // сколько настоящих секунд в игровой; 1 — обычная партия
+}
+
+func newGameClock(startSec, serverNowMs int64, received time.Time) gameClock {
+	c := gameClock{start: time.Unix(startSec, 0), scale: 1}
+	if startSec <= 0 || serverNowMs <= 0 || received.IsZero() {
+		return c
+	}
+	real := received.Sub(c.start)
+	game := time.UnixMilli(serverNowMs).Sub(c.start)
+	if real < time.Minute || game <= 0 {
+		return c
+	}
+	if speed := math.Round(float64(game) / float64(real)); speed > 1 {
+		c.scale = 1 / speed
+	}
+	return c
+}
+
+// real — настоящее время для игровых миллисекунд.
+func (c gameClock) real(ms int64) time.Time {
+	t := time.UnixMilli(ms)
+	if c.scale == 1 {
+		return t
+	}
+	return c.start.Add(time.Duration(float64(t.Sub(c.start)) * c.scale))
+}
+
+// duration — сколько длится игровой отрезок по настоящим часам.
+func (c gameClock) duration(d time.Duration) time.Duration {
+	return time.Duration(float64(d) * c.scale)
+}
