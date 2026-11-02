@@ -99,6 +99,14 @@ func loadSettings() (settings, error) {
 
 	r := bot.DefaultRules()
 	r.FoodLow = flt("RULE_FOOD_LOW", r.FoodLow)
+	if v := strings.TrimSpace(os.Getenv("UNITS")); v != "" {
+		r.Units = nil
+		for _, u := range strings.Split(v, ",") {
+			if u = strings.ToLower(strings.TrimSpace(u)); u != "" {
+				r.Units = append(r.Units, u)
+			}
+		}
+	}
 	r.HarbourDay = integer("RULE_HARBOUR_DAY", r.HarbourDay)
 	r.RailwayDay = integer("RULE_RAILWAY_DAY", r.RailwayDay)
 	r.FactoryReserveDay = integer("RULE_FACTORY_RESERVE_DAY", r.FactoryReserveDay)

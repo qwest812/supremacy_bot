@@ -4,6 +4,11 @@ package bot
 // в коде (economy.go, recruit.go, market.go, diplomacy.go), а пороги —
 // здесь, чтобы их можно было подстраивать из .env, не трогая логику.
 type Rules struct {
+	// Units — какие рода войск бот заказывает (имена типов у игры
+	// строчными). Из них в каждой провинции берётся то, что игра там
+	// разрешает и что даёт больше силы на единицу цены.
+	Units []string
+
 	// FoodLow — мало зерна: казарма, в которой производится кавалерия или
 	// штурмовики, остаётся включённой, но бот об этом предупреждает.
 	// Без такого производства казарма и так стоит на паузе.
@@ -98,6 +103,7 @@ type Rules struct {
 func DefaultRules() Rules {
 	return Rules{
 		FoodLow:             3000,
+		Units:               []string{uCar, uCavalry, uStormtroopers, "tank", "mkiv_tank"},
 		HarbourDay:          2,
 		RailwayDay:          3,
 		FactoryReserveDay:   5,

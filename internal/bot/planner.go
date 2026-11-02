@@ -10,7 +10,7 @@ import "fmt"
 //
 //  1. пункты призыва — дёшевы и нужны везде;
 //  2. фабрика — с пятого дня её цена откладывается заранее;
-//  3. мастерские в двойных провинциях, сразу за ними бронеавтомобили;
+//  3. мастерские в двойных провинциях, сразу за ними войска (recruit.go);
 //  4. казармы, порты, железные дороги;
 //  5. пауза казарм без кавалерии и штурмовиков и торговля — им ресурсы
 //     не нужны или нужен только излишек;
@@ -45,12 +45,12 @@ func Decide(w *World, r Rules, mem *Memory) *Plan {
 	s.stepRecruiting()
 	s.stepFactory()
 	s.stepWorkshop()
-	stepCars(w, b, plan, map[int]bool{})
+	units := stepUnits(w, r, b, plan)
 	s.stepBarracks()
 	s.stepHarbour()
 	s.stepRailway()
 
-	stepBarracksPause(w, r, plan)
+	stepBarracksPause(w, r, plan, units)
 	planMarket(w, b, r, mem, plan)
 	// Армии раньше дипломатии: если в этот заход объявим войну, право
 	// прохода этому боту выдавать уже нельзя.
