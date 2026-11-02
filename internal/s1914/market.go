@@ -61,8 +61,11 @@ func (r *gameStateResponse) market(me int, clock gameClock) Market {
 	m.Asks = orderLists(res.Asks)
 	m.Bids = orderLists(res.Bids)
 	for _, w := range res.Trading.Offers {
-		if w.PartyB == me && !w.Processed {
+		switch {
+		case w.PartyB == me && !w.Processed:
 			m.Incoming = append(m.Incoming, w.offer(clock))
+		case w.PartyA == me && !w.Processed:
+			m.Outgoing = append(m.Outgoing, w.offer(clock))
 		}
 	}
 	for _, w := range res.Trading.Past {

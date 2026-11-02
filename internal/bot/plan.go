@@ -74,6 +74,8 @@ type Plan struct {
 	// Next — когда стоит зайти снова, и почему именно тогда.
 	Next    time.Time
 	NextWhy string
+	// Intents — что бот собирается сделать дальше (intents.go).
+	Intents []Intent
 }
 
 func (p *Plan) add(d Decision) { p.Decisions = append(p.Decisions, d) }

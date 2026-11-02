@@ -137,7 +137,7 @@ func (r *Runner) Visit(ctx context.Context) (time.Time, error) {
 		plan = Decide(w, rules, mem)
 		sent := r.execute(ctx, v, w, plan, j, done, rec)
 		if v.State.Ended {
-			j.Snapshot(first, mem, rec.decisions, rec.outcomes)
+			j.Snapshot(first, mem, rec.decisions, rec.outcomes, plan.Intents)
 			mem.Notes = j.Notes()
 			_ = mem.Save(memPath)
 			return time.Time{}, errGameOver
@@ -161,7 +161,7 @@ func (r *Runner) Visit(ctx context.Context) (time.Time, error) {
 		}
 	}
 
-	j.Snapshot(first, mem, rec.decisions, rec.outcomes)
+	j.Snapshot(first, mem, rec.decisions, rec.outcomes, plan.Intents)
 	mem.Visits++
 	mem.LastVisit = time.Now()
 	mem.Notes = j.Notes()

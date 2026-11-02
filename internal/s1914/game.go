@@ -504,6 +504,9 @@ type Market struct {
 	// кончились прошлые сделки.
 	Incoming []TradeOffer
 	Past     []TradeOffer
+	// Outgoing — наши предложения, на которые ещё не ответили. Ресурсы
+	// по ним игра не списывает до ответа (видно вживую 02.11.2026).
+	Outgoing []TradeOffer
 }
 
 // Order — заявка на бирже.

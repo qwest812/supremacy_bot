@@ -58,5 +58,6 @@ func Decide(w *World, r Rules, mem *Memory) *Plan {
 	planDiplomacy(w, r, mem, plan)
 
 	plan.wake(g.NextDay.Add(buildAfter), fmt.Sprintf("смена дня (наступит %d-й)", g.Day+1))
+	plan.Intents = intents(w, r, mem, plan)
 	return plan
 }

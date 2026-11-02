@@ -196,6 +196,34 @@ function renderProvinces() {
   }
   const fs = S.view ? S.view.w / 110 : 9;
   $('labels').style.setProperty('--lf', Math.max(3, Math.min(fs, 40)) + 'px');
+  // Значки зданий под названием наших провинций, как в игре.
+  if (snap && S.layers.labels) {
+    for (const p of snap.provinces) {
+      if (p.owner !== snap.me || !S.centers[p.id]) continue;
+      const done = (p.buildings || []).filter(b => !b.includes('недострой')).map(buildingIcon).join('');
+      const doing = (p.building || []).map(b => '⏳' + buildingIcon(b)).join('');
+      if (!done && !doing) continue;
+      const t = document.createElementNS(SVGNS, 'text');
+      const c = S.centers[p.id];
+      t.setAttribute('x', c[0]); t.setAttribute('y', c[1] + Math.max(3, Math.min(fs, 40)) * 1.3);
+      t.setAttribute('class', 'mark icons');
+      t.style.fontSize = Math.max(3, Math.min(fs, 40)) + 'px';
+      t.textContent = done + doing;
+      marks.appendChild(t);
+    }
+  }
+}
+
+// buildingIcon — значок здания по его названию (игра шлёт их на языке
+// аккаунта).
+function buildingIcon(name) {
+  const n = String(name).toLowerCase();
+  const icons = [
+    [/recruit|призыв/, '🎖'], [/workshop|мастерск/, '🔧'], [/barrack|казарм/, '⛺'],
+    [/harbo|port|порт/, '⚓'], [/rail|железн/, '🚂'], [/factor|фабрик/, '🏭'], [/fort|крепост/, '🏰'],
+  ];
+  for (const [re, ic] of icons) if (re.test(n)) return ic;
+  return '▪';
 }
 
 function pxToMap(px) {
@@ -214,12 +242,22 @@ function renderArmies() {
     const pl = S.snap.players[a.owner];
     const kind = a.owner === me ? 'ours' : (pl && pl.hostile ? 'hostile' : 'other');
     if (kind === 'other' && !S.layers.armies) continue;
-    const r = pxToMap(Math.min(3 + Math.sqrt(a.power) * 0.9, 16));
-    const c = document.createElementNS(SVGNS, 'circle');
-    c.setAttribute('cx', a.x); c.setAttribute('cy', a.y); c.setAttribute('r', r);
-    c.setAttribute('class', `army ${kind}${a.fighting ? ' fight' : ''}`);
-    c.dataset.army = a.id;
-    g.appendChild(c);
+    // Значок армии как в игре: плашка с числом войск.
+    const label = String(a.size || Math.round(a.power));
+    const h = pxToMap(14), w = pxToMap(8 + label.length * 7);
+    const box = document.createElementNS(SVGNS, 'rect');
+    box.setAttribute('x', a.x - w / 2); box.setAttribute('y', a.y - h / 2);
+    box.setAttribute('width', w); box.setAttribute('height', h);
+    box.setAttribute('rx', h / 4);
+    box.setAttribute('class', `army ${kind}${a.fighting ? ' fight' : ''}`);
+    box.dataset.army = a.id;
+    g.appendChild(box);
+    const t = document.createElementNS(SVGNS, 'text');
+    t.setAttribute('x', a.x); t.setAttribute('y', a.y + h * 0.32);
+    t.setAttribute('class', 'army-n');
+    t.style.fontSize = pxToMap(10) + 'px';
+    t.textContent = (a.fighting ? '⚔' : '') + label;
+    g.appendChild(t);
     if (a.to) {
       const l = document.createElementNS(SVGNS, 'line');
       l.setAttribute('x1', a.x); l.setAttribute('y1', a.y);
@@ -608,7 +646,7 @@ function renderNow() {
   else html += '<ul class="changes">' + ch.map(c => `<li class="${c.kind}">${c.text}</li>`).join('') + '</ul>';
 
   // Отказы игры в этом заходе.
-  const refused = snap.decisions.filter(d => !d.note && (d.outcome || '').startsWith('ОТКАЗ'));
+  const refused = snap.decisions.filter(d => !d.note && /^отказ/i.test(d.outcome || ''));
   if (refused.length) {
     html += '<h3>Игра отказала</h3><ul class="changes">' + refused.map(d =>
       `<li class="bad">${esc(d.what)} — ${esc(d.outcome)}</li>`).join('') + '</ul>';
@@ -663,6 +701,94 @@ function renderNow() {
     centerOn(id);
     selectProvince(id, true);
   });
+}
+
+
+// ---------- сделано и планы ----------
+
+const CAT_ICON = { build: '🏗', recruit: '🪖', attack: '⚔', defense: '🛡', market: '💰', diplomacy: '🤝' };
+
+function bindPlinks(el) {
+  el.querySelectorAll('[data-p]').forEach(a => a.onclick = (e) => {
+    e.preventDefault();
+    const id = +a.dataset.p;
+    if (!id) return;
+    centerOn(id);
+    selectProvince(id, true);
+  });
+}
+
+// renderDone — всё, что бот отправил в игру, по заходам, свежее сверху.
+function renderDone() {
+  const el = $('tab-done');
+  const acts = S.events.filter(e => e.type === 'decision' && !e.note && e.visit <= S.visit);
+  if (!acts.length) { el.innerHTML = '<p class="muted">Бот ещё ничего не сделал.</p>'; return; }
+  const byVisit = new Map();
+  for (const e of acts) {
+    if (!byVisit.has(e.visit)) byVisit.set(e.visit, []);
+    byVisit.get(e.visit).push(e);
+  }
+  const total = acts.filter(e => e.outcome === 'сделано').length;
+  const refused = acts.filter(e => /^отказ/i.test(e.outcome || '')).length;
+  let html = `<p class="muted">Всего приказов: ${total}${refused ? ` · отказов игры: <b class="bad">${refused}</b>` : ''}</p>`;
+  for (const [visit, list] of [...byVisit.entries()].reverse()) {
+    const v = S.visits.find(x => x.visit === visit) || {};
+    html += `<h3>Заход №${visit} · день ${v.day ?? '?'} · ${fmtTime(v.time)}</h3><ul class="acts">`;
+    for (const e of list) {
+      const st = e.outcome === 'сделано' ? '<span class="st ok">✓</span>'
+        : /^отказ/i.test(e.outcome || '') ? `<span class="st bad" title="${esc(e.outcome)}">✗</span>`
+        : '<span class="st plan">план</span>';
+      html += `<li class="cat-${e.category}" ${e.province ? `data-p="${e.province}"` : ''}>
+        ${st} <span class="ic">${CAT_ICON[e.category] || ''}</span>
+        <span class="what">${esc(e.what)}</span>
+        <div class="why">${esc(e.why)}${/^отказ/i.test(e.outcome || '') ? ' — <b class="bad">' + esc(e.outcome) + '</b>' : ''}</div></li>`;
+    }
+    html += '</ul>';
+  }
+  el.innerHTML = html;
+  bindPlinks(el);
+}
+
+// renderPlans — что бот собирается сделать после выбранного захода.
+function renderPlans() {
+  const el = $('tab-plans');
+  const list = (S.snap && S.snap.intents) || [];
+  if (!list.length) {
+    el.innerHTML = '<p class="muted">Планов в этом заходе не записано (они пишутся с этой версии бота — дождитесь следующего захода).</p>';
+    return;
+  }
+  const groups = [
+    ['Ждёт ресурсов или времени', i => i.category === 'build' || i.category === 'recruit'],
+    ['Рынок', i => i.category === 'market'],
+    ['Война', i => i.category === 'attack' || i.category === 'defense'],
+  ];
+  // Когда бот придёт на самом деле — из итога захода; ближайшее событие
+  // партии может быть и позже (бот заходит не реже планового обхода).
+  const event = list.find(i => i.what === 'ближайшее событие' || i.what === 'следующий заход');
+  const end = S.ends[S.visit];
+  let html = '<div class="now-head">';
+  if (end && end.next) html += `<div><b>Следующий заход:</b> ${fmtTime(end.next)} — ${esc(end.why || '')}</div>`;
+  if (event) html += `<div class="muted">Ближайшее событие партии: ${esc(event.when)} — ${esc(event.why)}</div>`;
+  html += '</div>';
+  const used = new Set(event ? [event] : []);
+  const sched = list.filter(i => /^день /.test(i.when));
+  sched.forEach(i => used.add(i));
+  for (const [title, f] of groups) {
+    const items = list.filter(i => !used.has(i) && f(i));
+    items.forEach(i => used.add(i));
+    if (!items.length) continue;
+    html += `<h3>${title}</h3><ul class="acts">` + items.map(i => `
+      <li class="cat-${i.category}" ${i.province ? `data-p="${i.province}"` : ''}>
+        <span class="when">${esc(i.when)}</span> <span class="ic">${CAT_ICON[i.category] || ''}</span>
+        <span class="what">${esc(i.what)}</span><div class="why">${esc(i.why)}</div></li>`).join('') + '</ul>';
+  }
+  if (sched.length) {
+    html += '<h3>По дням</h3><ul class="acts">' + sched.map(i => `
+      <li class="cat-${i.category}"><span class="when">${esc(i.when)}</span> <span class="ic">${CAT_ICON[i.category] || ''}</span>
+        <span class="what">${esc(i.what)}</span><div class="why">${esc(i.why)}</div></li>`).join('') + '</ul>';
+  }
+  el.innerHTML = html;
+  bindPlinks(el);
 }
 
 // ---------- сводка и графики ----------
@@ -769,13 +895,15 @@ function renderAll() {
   renderLegend();
   renderDecisions();
   renderNow();
+  renderDone();
+  renderPlans();
   renderSummary();
   renderProvinceTab();
 }
 
 function switchTab(name) {
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
-  for (const t of ['now', 'decisions', 'summary', 'province']) $('tab-' + t).hidden = t !== name;
+  for (const t of ['now', 'done', 'plans', 'decisions', 'summary', 'province']) $('tab-' + t).hidden = t !== name;
   saveHash();
 }
 

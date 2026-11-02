@@ -118,6 +118,7 @@ func loadSettings() (settings, error) {
 	r.SwapRatio = flt("TRADE_SWAP_RATIO", r.SwapRatio)
 	r.SellAbove = flt("TRADE_SELL_ABOVE", r.SellAbove)
 	r.TradeHumans = boolean("TRADE_WITH_HUMANS", r.TradeHumans)
+	r.MaxPending = integer("TRADE_MAX_PENDING", r.MaxPending)
 	r.RightOfWay = boolean("RIGHT_OF_WAY_TO_BOTS", r.RightOfWay)
 	r.War = boolean("WAR", r.War)
 	r.WarOnHumans = boolean("WAR_ON_HUMANS", r.WarOnHumans)

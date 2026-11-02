@@ -72,7 +72,7 @@ func WriteDemo(load func() (*s1914.GameState, *s1914.MapGeometry, error), logDir
 			j.Decision(w, d, "")
 			rec.add(d, out)
 		}
-		j.Snapshot(w, mem, rec.decisions, rec.outcomes)
+		j.Snapshot(w, mem, rec.decisions, rec.outcomes, plan.Intents)
 		j.End(Summary(plan, done), plan.Next, plan.NextWhy)
 		mem.Visits++
 		mem.Notes = j.Notes()

@@ -53,6 +53,9 @@ type Rules struct {
 	SellAbove float64
 	// TradeHumans — предлагать обмен и живым игрокам, не только ботам.
 	TradeHumans bool
+	// MaxPending — сколько наших предложений может висеть без ответа:
+	// больше — новых не шлём, ждём ответов.
+	MaxPending int
 
 	// RightOfWay — выдавать ботам право прохода.
 	RightOfWay bool
@@ -115,6 +118,7 @@ func DefaultRules() Rules {
 		SwapRatio:           1.1,
 		SellAbove:           8000,
 		TradeHumans:         true,
+		MaxPending:          4,
 		RightOfWay:          true,
 		War:                 true,
 		WarOnHumans:         false,

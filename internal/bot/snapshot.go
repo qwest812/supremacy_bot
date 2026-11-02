@@ -27,6 +27,8 @@ type Snapshot struct {
 	Provinces []SnapProvince     `json:"provinces"`
 	Armies    []SnapArmy         `json:"armies"`
 	Decisions []SnapDecision     `json:"decisions"`
+	// Intents — планы бота после этого захода.
+	Intents []Intent `json:"intents,omitempty"`
 }
 
 type SnapPlayer struct {
@@ -57,13 +59,15 @@ type SnapProvince struct {
 }
 
 type SnapArmy struct {
-	ID       int64       `json:"id"`
-	Owner    int         `json:"owner"`
-	X        float64     `json:"x"`
-	Y        float64     `json:"y"`
-	Location int         `json:"location"`
-	Power    float64     `json:"power"`
-	Units    string      `json:"units"`
+	ID       int64   `json:"id"`
+	Owner    int     `json:"owner"`
+	X        float64 `json:"x"`
+	Y        float64 `json:"y"`
+	Location int     `json:"location"`
+	Power    float64 `json:"power"`
+	Units    string  `json:"units"`
+	// Size — сколько войск в армии: число на значке, как в игре.
+	Size     int         `json:"size"`
 	Fighting bool        `json:"fighting,omitempty"`
 	To       *[2]float64 `json:"to,omitempty"`
 }
@@ -91,10 +95,10 @@ func points(path []s1914.MapPoint) [][2]float64 {
 
 // Snapshot пишет снимок захода. w — партия на миг входа; decisions
 // и outcomes — все решения захода (всех кругов) и чем они кончились.
-func (j *Journal) Snapshot(w *World, mem *Memory, decisions []Decision, outcomes []string) {
+func (j *Journal) Snapshot(w *World, mem *Memory, decisions []Decision, outcomes []string, intents []Intent) {
 	g := w.G
 	snap := Snapshot{Visit: j.visit, Time: w.Now.Format(time.RFC3339), Day: g.Day, Me: g.Me, Dry: j.dry,
-		Players: map[int]SnapPlayer{}}
+		Players: map[int]SnapPlayer{}, Intents: intents}
 	for id, p := range g.Players {
 		snap.Players[id] = SnapPlayer{Nation: p.Nation, Color: p.Color, Bot: p.NativeAI, Human: !p.IsAI,
 			Hostile: w.Hostile(id), Target: id == mem.WarTarget, Points: g.Race.Points[id],
@@ -144,7 +148,7 @@ func (j *Journal) Snapshot(w *World, mem *Memory, decisions []Decision, outcomes
 			continue
 		}
 		sa := SnapArmy{ID: a.ID, Owner: a.Owner, X: a.Pos.X, Y: a.Pos.Y, Location: a.Location,
-			Power: w.Power(a), Units: unitsText(w, a), Fighting: a.Fighting}
+			Power: w.Power(a), Units: unitsText(w, a), Fighting: a.Fighting, Size: armySize(a)}
 		if a.MarchTo != nil {
 			sa.To = &[2]float64{a.MarchTo.X, a.MarchTo.Y}
 		}
@@ -246,4 +250,13 @@ func (j *Journal) WriteMap(w *World) {
 	if raw, err := json.Marshal(m); err == nil {
 		_ = os.WriteFile(path, raw, 0o644)
 	}
+}
+
+// armySize — сколько войск в армии.
+func armySize(a s1914.Army) int {
+	n := 0
+	for _, u := range a.Units {
+		n += u.Size
+	}
+	return n
 }

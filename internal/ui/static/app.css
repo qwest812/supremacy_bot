@@ -210,3 +210,23 @@ table.kv td:first-child { color: var(--muted); width: 40%; }
 .pill.target { border: 1px solid var(--attack); }
 .pill.build { border-left: 3px solid var(--build); }
 .pill.unit { border-left: 3px solid var(--recruit); }
+.army-n { fill: #fff; font-weight: 700; text-anchor: middle; pointer-events: none; }
+.mark.icons { opacity: .95; }
+
+/* сделано и планы */
+.acts { list-style: none; padding: 0; margin: 0 0 8px; display: grid; gap: 4px; }
+.acts li { padding: 6px 10px; border-radius: 8px; background: var(--chip); border-left: 3px solid var(--muted); }
+.acts li[data-p] { cursor: pointer; }
+.acts li.cat-build { border-left-color: var(--build); }
+.acts li.cat-recruit { border-left-color: var(--recruit); }
+.acts li.cat-attack { border-left-color: var(--attack); }
+.acts li.cat-defense { border-left-color: var(--defense); }
+.acts li.cat-market { border-left-color: var(--market); }
+.acts li.cat-diplomacy { border-left-color: var(--diplomacy); }
+.acts .what { font-weight: 600; }
+.acts .why { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.acts .st { font-weight: 700; }
+.acts .st.ok { color: var(--ok); }
+.acts .st.plan { color: var(--plan); font-size: 11px; }
+.acts .when { font-size: 11px; font-weight: 700; padding: 1px 6px; border-radius: 6px; background: var(--panel, #fff); }
+.tabs button { padding-left: 8px; padding-right: 8px; }

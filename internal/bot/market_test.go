@@ -101,3 +101,27 @@ func TestBigSurplusSold(t *testing.T) {
 		t.Fatal("обмен без дефицита")
 	}
 }
+
+// Висят без ответа MaxPending наших предложений — новых не шлём; тому,
+// кто не ответил, второе не предлагаем.
+func TestPendingOffersLimitNewOnes(t *testing.T) {
+	w := fixtureWorld(t)
+	w.G.Day = 2
+	r := DefaultRules()
+	market(w, r.KeepStock+r.SellAbove+r.TradeChunk*2)
+	bots := w.NativeBots()
+	for i := 0; i < r.MaxPending; i++ {
+		w.G.Market.Outgoing = append(w.G.Market.Outgoing, s1914.TradeOffer{ID: int64(i), PartyA: w.G.Me,
+			PartyB: bots[i].ID, OffersA: map[int]float64{s1914.ResourceWood: 2000}})
+	}
+	plan := marketOnly(w, freshMem())
+	if got := find(plan, "продажа-ботам", true); len(got) != 0 {
+		t.Fatalf("при %d висящих шлём новые: %s", r.MaxPending, got[0].What)
+	}
+	w.G.Market.Outgoing = w.G.Market.Outgoing[:1]
+	for _, d := range find(marketOnly(w, freshMem()), "продажа-ботам", true) {
+		if strings.Contains(d.What, bots[0].Nation) {
+			t.Fatalf("второе предложение тому, кто не ответил: %s", d.What)
+		}
+	}
+}

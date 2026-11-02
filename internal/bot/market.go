@@ -44,6 +44,11 @@ type need struct {
 
 func planMarket(w *World, b *Budget, r Rules, mem *Memory, plan *Plan) {
 	tradeResults(w, mem, plan)
+	// Обещанное в висящих предложениях уйдёт, как только их примут:
+	// считаем его отданным.
+	for _, o := range w.G.Market.Outgoing {
+		b.Pay(o.OffersA, false)
+	}
 	needs := deficits(w, b, r)
 	answerOffers(w, b, r, needs, plan)
 	if !r.Trade {
@@ -57,6 +62,11 @@ func planMarket(w *World, b *Budget, r Rules, mem *Memory, plan *Plan) {
 		plan.note(CatMarket, "дефицит", "дефицит", strings.Join(parts, "; "))
 	}
 	buyNeeds(w, b, r, needs, plan)
+	if n := len(w.G.Market.Outgoing); n >= r.MaxPending {
+		plan.note(CatMarket, "ждём-ответа", "предложения",
+			fmt.Sprintf("без ответа висит %d наших предложений (предел %d) — новых не шлём, ждём ответов", n, r.MaxPending))
+		return
+	}
 	sent := swapForNeeds(w, b, r, mem, needs, plan)
 	sellSurplus(w, b, r, mem, needs, plan, sent)
 }
@@ -302,7 +312,7 @@ func pickBot(w *World, bots []s1914.Player, res int, mem *Memory, used map[int]b
 	for i := range bots {
 		k := (mem.NextBot + i) % len(bots)
 		bot := bots[k]
-		if used[bot.ID] || w.Hostile(bot.ID) || bot.ID == mem.WarTarget ||
+		if used[bot.ID] || pending(w, bot.ID) || w.Hostile(bot.ID) || bot.ID == mem.WarTarget ||
 			w.Now.Before(mem.Refused[refusedKey(bot.ID, res)]) {
 			continue
 		}
@@ -310,6 +320,16 @@ func pickBot(w *World, bots []s1914.Player, res int, mem *Memory, used map[int]b
 		return bot, true
 	}
 	return s1914.Player{}, false
+}
+
+// pending — у игрока висит наше предложение без ответа: второе не шлём.
+func pending(w *World, player int) bool {
+	for _, o := range w.G.Market.Outgoing {
+		if o.PartyB == player {
+			return true
+		}
+	}
+	return false
 }
 
 // round100 — вверх до сотни.
