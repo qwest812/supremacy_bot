@@ -232,3 +232,25 @@ func TestRetreatFromHopeless(t *testing.T) {
 		t.Fatalf("отступлений %d, подкреплений в обречённую провинцию %d", retreat, reinforce)
 	}
 }
+
+// На слабого врага у границы уже идёт наша армия (атака ведёт к его
+// позиции, а не в центр провинции) — вторую не посылаем.
+func TestNoSecondStrikeOnSameEnemy(t *testing.T) {
+	w, bot, home, lost := borderSetup(t)
+	w.G.Day = 3
+	w.G.Relations[bot] = relWar
+	enemy := enemyArmy(w, bot, lost.ID, 2)
+	enemy.Pos.X += 3
+	going := infantryArmy(w, 77, home.ID, 20)
+	to := enemy.Pos
+	going.MarchTo = &to
+	w.G.Armies = append(w.G.Armies, enemy, going)
+	w = NewWorld(w.G, w.Geo, w.Now)
+	plan := Decide(w, DefaultRules(), freshMem())
+	dump(t, plan)
+	for _, d := range decisions(plan, CatDefense, true) {
+		if d.Rule == "разбить-армию-у-границы" {
+			t.Fatalf("послали вторую армию: %s", d.What)
+		}
+	}
+}

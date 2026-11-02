@@ -107,6 +107,10 @@ func (c *commander) scan() {
 			if a.MarchTo != nil {
 				if id, ok := centerOf[*a.MarchTo]; ok {
 					where = id
+				} else if id := nearestCenter(w.Geo, *a.MarchTo); id != 0 {
+					// Атака идёт к позиции вражеской армии, а не в центр:
+					// считаем её в ближайшей провинции.
+					where = id
 				}
 			}
 			c.ourAt[where] += f.power
@@ -154,6 +158,19 @@ func (c *commander) scan() {
 		return w.Value(pi) > w.Value(pj)
 	})
 }
+
+// nearestCenter — провинция, чей центр ближе всего к точке.
+func nearestCenter(geo *s1914.MapGeometry, pt s1914.MapPoint) int {
+	best, bd := 0, 0.0
+	for id, c := range geo.Centers {
+		if d := dist2(c, pt); best == 0 || d < bd || d == bd && id < best {
+			best, bd = id, d
+		}
+	}
+	return best
+}
+
+func dist2(a, b s1914.MapPoint) float64 { return (a.X-b.X)*(a.X-b.X) + (a.Y-b.Y)*(a.Y-b.Y) }
 
 // free — армия, которой можно дать приказ: не в бою, без марша, не
 // размещается и не получила приказа в этот заход. home разрешает брать
@@ -296,6 +313,13 @@ func (c *commander) defend() {
 		}
 		head := fmt.Sprintf("враг (%s, сила %.0f) %s", enemies, t.power, where)
 
+		// Туда уже идут наши с перевесом (приказ прошлого круга или захода) —
+		// второй раз не посылаем.
+		if going := c.ourAt[t.at]; !t.inside && going >= t.power*r.AttackRatio {
+			c.plan.noteAt(t.at, CatDefense, "разбить-армию-у-границы", c.name(t.at),
+				fmt.Sprintf("%s; туда уже идут наши силой %.0f — хватает", head, going))
+			continue
+		}
 		// Бить первыми, если перевес. Враг в своей провинции — туда можно,
 		// раз мы воюем; в нашей — тем более.
 		cands := c.nearest(t.at, r.DefendHops, true)
