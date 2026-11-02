@@ -7,6 +7,7 @@ package bot
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -50,6 +51,8 @@ type SnapProvince struct {
 	// Buildings и Building — здания и идущие стройки, только у наших.
 	Buildings []string `json:"buildings,omitempty"`
 	Building  []string `json:"building,omitempty"`
+	// Producing — войска, которые сейчас производятся: «Armored Car до 15:20».
+	Producing []string `json:"producing,omitempty"`
 	Resource  string   `json:"resource,omitempty"`
 }
 
@@ -124,6 +127,13 @@ func (j *Journal) Snapshot(w *World, mem *Memory, decisions []Decision, outcomes
 			}
 			for _, c := range p.Building {
 				sp.Building = append(sp.Building, g.Upgrades[c.UpgradeID].Name+" до "+clock(c.Ends, w.Now))
+			}
+			for _, pr := range p.Producing {
+				name := g.UnitStats[pr.UnitTypeID].Name
+				if name == "" {
+					name = fmt.Sprintf("войско %d", pr.UnitTypeID)
+				}
+				sp.Producing = append(sp.Producing, name+" до "+clock(pr.Ends, w.Now))
 			}
 		}
 		snap.Provinces = append(snap.Provinces, sp)

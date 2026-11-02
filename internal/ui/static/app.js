@@ -78,7 +78,7 @@ function saveHash() {
   if (S.visit) h.set('visit', S.visit);
   if (S.sel) h.set('p', S.sel);
   const tab = document.querySelector('.tabs button.on');
-  if (tab && tab.dataset.tab !== 'decisions') h.set('tab', tab.dataset.tab);
+  if (tab && tab.dataset.tab !== 'now') h.set('tab', tab.dataset.tab);
   history.replaceState(null, '', '#' + h.toString());
 }
 
@@ -107,6 +107,13 @@ async function showVisit(n, fit) {
     catch (e) { S.snaps[n] = null; }
   }
   S.snap = S.snaps[n];
+  // Прошлый заход нужен вкладке «Сейчас»: что изменилось с тех пор.
+  const i = S.visits.findIndex(x => x.visit === n);
+  const pv = i > 0 ? S.visits[i - 1].visit : 0;
+  if (pv && S.snaps[pv] === undefined) {
+    try { S.snaps[pv] = await getJSON(`api/games/${S.game}/snapshots/${pv}`); }
+    catch (e) { S.snaps[pv] = null; }
+  }
   if (fit && S.snap) fitOurs();
   renderAll();
   saveHash();
@@ -516,6 +523,148 @@ function renderProvinceTab() {
   el.innerHTML = html;
 }
 
+
+// ---------- сейчас: что в партии и что изменилось ----------
+
+function provName(id) {
+  const p = S.map && S.map.provinces.find(x => x.id === id);
+  return p && p.name ? p.name : 'провинция ' + id;
+}
+function nationName(snap, id) {
+  const p = snap && snap.players[id];
+  return p && p.nation ? p.nation : (id > 0 ? 'игрок ' + id : 'никто');
+}
+// nearestProv — провинция, чей центр ближе всего к точке (куда идёт армия).
+function nearestProv(pt) {
+  let best = 0, bd = Infinity;
+  for (const id in S.centers) {
+    const c = S.centers[id], d = (c[0] - pt[0]) ** 2 + (c[1] - pt[1]) ** 2;
+    if (d < bd) { bd = d; best = +id; }
+  }
+  return best;
+}
+function plink(id) { return `<a href="#" class="plink" data-p="${id}">${esc(provName(id))}</a>`; }
+function num(v) { return Math.round(v).toLocaleString('ru'); }
+
+// changes — события между прошлым и этим заходом, словами.
+function changes(prev, cur) {
+  const out = [];
+  if (!prev) return out;
+  const me = cur.me;
+  const was = {};
+  for (const p of prev.provinces) was[p.id] = p;
+  let others = 0;
+  for (const p of cur.provinces) {
+    const o = was[p.id];
+    if (!o || o.owner === p.owner) continue;
+    if (p.owner === me) out.push({ kind: 'good', text: `Взяли ${plink(p.id)} у ${esc(nationName(prev, o.owner))}` });
+    else if (o.owner === me) out.push({ kind: 'bad', text: `Потеряли ${plink(p.id)} — теперь у ${esc(nationName(cur, p.owner))}` });
+    else others++;
+  }
+  for (const p of cur.provinces) {
+    const o = was[p.id];
+    if (!o || p.owner !== me || o.owner !== me) continue;
+    const before = new Set(o.buildings || []);
+    for (const b of p.buildings || []) {
+      if (!before.has(b) && !b.includes('недострой')) out.push({ kind: 'good', text: `Достроено: ${esc(b)} в ${plink(p.id)}` });
+    }
+  }
+  const ours = (s) => s.armies.filter(a => a.owner === s.me);
+  const pw = (list) => list.reduce((t, a) => t + a.power, 0);
+  const a0 = ours(prev), a1 = ours(cur);
+  const d = pw(a1) - pw(a0);
+  if (Math.abs(d) >= 1) out.push({ kind: d > 0 ? 'good' : 'bad',
+    text: `Сила наших армий ${d > 0 ? 'выросла' : 'упала'} на ${num(Math.abs(d))}: ${num(pw(a0))} → ${num(pw(a1))} (армий ${a0.length} → ${a1.length})` });
+  const ids = new Set(a1.map(a => a.id));
+  const gone = a0.filter(a => !ids.has(a.id));
+  if (gone.length) out.push({ kind: 'info', text: `Армий больше нет: ${gone.length} (${gone.map(a => `${esc(a.units)} в ${plink(a.location)}`).join('; ')}) — слились в стак или погибли` });
+  const fights = a1.filter(a => a.fighting);
+  if (fights.length) out.push({ kind: 'bad', text: `В бою: ${fights.map(a => `${esc(a.units)} в ${plink(a.location)}`).join('; ')}` });
+  if (others) out.push({ kind: 'info', text: `У других стран сменили хозяина провинций: ${others}` });
+  return out;
+}
+
+function renderNow() {
+  const el = $('tab-now');
+  const snap = S.snap;
+  const v = S.visits.find(x => x.visit === S.visit);
+  if (!snap || !v) { el.innerHTML = '<p class="muted">Заходов ещё не было: запустите бота.</p>'; return; }
+  const i = S.visits.findIndex(x => x.visit === S.visit);
+  const prevVisit = i > 0 ? S.visits[i - 1] : null;
+  const prev = prevVisit ? S.snaps[prevVisit.visit] : null;
+  const end = S.ends[S.visit];
+  const last = i === S.visits.length - 1;
+  let html = `<div class="now-head">
+    <div><b>Заход №${v.visit}</b> · день ${v.day} · ${fmtTime(v.time)} ${v.dry ? '<span class="badge dry">только смотрим</span>' : '<span class="badge live">играем</span>'}</div>
+    ${end && end.next ? `<div class="muted">${last ? 'Следующий заход' : 'Следующий был намечен'}: ${fmtTime(end.next)} — ${esc(end.why || '')}</div>` : ''}
+    ${end && end.summary ? `<div class="muted">Сделано: ${esc(end.summary)}</div>` : ''}
+  </div>`;
+
+  // Что изменилось.
+  const ch = changes(prev, snap);
+  html += `<h3>Что изменилось${prevVisit ? ' с захода №' + prevVisit.visit + ' (' + fmtTime(prevVisit.time) + ')' : ''}</h3>`;
+  if (!prevVisit) html += '<p class="muted">Это первый заход — сравнивать не с чем.</p>';
+  else if (!ch.length) html += '<p class="muted">Ничего заметного.</p>';
+  else html += '<ul class="changes">' + ch.map(c => `<li class="${c.kind}">${c.text}</li>`).join('') + '</ul>';
+
+  // Отказы игры в этом заходе.
+  const refused = snap.decisions.filter(d => !d.note && (d.outcome || '').startsWith('ОТКАЗ'));
+  if (refused.length) {
+    html += '<h3>Игра отказала</h3><ul class="changes">' + refused.map(d =>
+      `<li class="bad">${esc(d.what)} — ${esc(d.outcome)}</li>`).join('') + '</ul>';
+  }
+
+  // Угрозы.
+  const danger = snap.provinces.filter(p => p.owner === snap.me && p.danger);
+  html += '<h3>Угрозы</h3>' + (danger.length
+    ? '<ul class="changes">' + danger.map(p => {
+        const near = snap.armies.filter(a => a.owner !== snap.me && snap.players[a.owner] && snap.players[a.owner].hostile &&
+          (a.location === p.id)).reduce((t, a) => t + a.power, 0);
+        return `<li class="bad">${plink(p.id)} под угрозой${near ? ' — враг внутри, сила ' + num(near) : ' — враг у границы'}</li>`;
+      }).join('') + '</ul>'
+    : '<p class="muted">Нет: врагов в наших и соседних провинциях не видно.</p>');
+
+  // Войны.
+  const wars = Object.entries(snap.players).filter(([, p]) => p.hostile);
+  html += '<h3>Войны</h3>' + (wars.length
+    ? '<p>' + wars.map(([, p]) => `<span class="pill${p.target ? ' target' : ''}">${esc(p.nation)}${p.target ? ' · цель' : ''}</span>`).join('') + '</p>'
+    : '<p class="muted">Ни с кем.</p>');
+
+  // Наши армии.
+  const ours = snap.armies.filter(a => a.owner === snap.me).sort((a, b) => b.power - a.power);
+  html += `<h3>Наши армии (${ours.length}, сила ${num(ours.reduce((t, a) => t + a.power, 0))})</h3>`;
+  html += ours.length ? '<table class="kv armies">' + ours.map(a => {
+    let st = 'стоит';
+    if (a.fighting) st = '<b class="bad">в бою</b>';
+    else if (a.to) st = 'идёт → ' + plink(nearestProv(a.to));
+    return `<tr><td>${plink(a.location)}</td><td>${esc(a.units)}<br><span class="muted">сила ${num(a.power)} · ${st}</span></td></tr>`;
+  }).join('') + '</table>' : '<p class="muted">Армий нет.</p>';
+
+  // Стройка и производство.
+  const busy = snap.provinces.filter(p => p.owner === snap.me && ((p.building || []).length || (p.producing || []).length));
+  html += '<h3>Стройка и войска</h3>' + (busy.length ? '<table class="kv">' + busy.map(p =>
+    `<tr><td>${plink(p.id)}</td><td>${(p.building || []).map(b => `<span class="pill build">${esc(b)}</span>`).join('')}${(p.producing || []).map(b => `<span class="pill unit">${esc(b)}</span>`).join('')}</td></tr>`).join('') + '</table>'
+    : '<p class="muted">Ничего не строится и не производится.</p>');
+
+  // Запасы: на сколько хватит того, что убывает.
+  html += '<h3>Запасы</h3><table class="kv">' + (v.resources || []).map(r => {
+    let left = '';
+    if (r.daily < 0) {
+      const days = r.amount / -r.daily;
+      left = ` · <span class="${days < 2 ? 'bad' : 'warn'}">хватит на ${days.toFixed(1)} сут</span>`;
+    }
+    return `<tr><td>${esc(r.name)}</td><td>${num(r.amount)} <span class="muted">(${r.daily >= 0 ? '+' : ''}${num(r.daily)}/сут)</span>${left}</td></tr>`;
+  }).join('') + '</table>';
+
+  el.innerHTML = html;
+  el.querySelectorAll('.plink').forEach(a => a.onclick = (e) => {
+    e.preventDefault();
+    const id = +a.dataset.p;
+    centerOn(id);
+    selectProvince(id, true);
+  });
+}
+
 // ---------- сводка и графики ----------
 
 function chart(series, current) {
@@ -619,13 +768,14 @@ function renderAll() {
   renderOrders();
   renderLegend();
   renderDecisions();
+  renderNow();
   renderSummary();
   renderProvinceTab();
 }
 
 function switchTab(name) {
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === name));
-  for (const t of ['decisions', 'summary', 'province']) $('tab-' + t).hidden = t !== name;
+  for (const t of ['now', 'decisions', 'summary', 'province']) $('tab-' + t).hidden = t !== name;
   saveHash();
 }
 

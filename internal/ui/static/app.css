@@ -197,3 +197,16 @@ table.kv td:first-child { color: var(--muted); width: 40%; }
   .panel { width: auto; min-height: 50vh; }
   .legend { max-width: calc(100% - 20px); }
 }
+
+/* вкладка «Сейчас» */
+.now-head { display: grid; gap: 4px; padding-bottom: 6px; border-bottom: 1px solid var(--line, #ddd); }
+.changes { list-style: none; padding: 0; margin: 0 0 6px; display: grid; gap: 4px; }
+.changes li { padding: 6px 10px; border-radius: 8px; background: var(--chip); border-left: 3px solid var(--muted); }
+.changes li.good { border-left-color: var(--ok); }
+.changes li.bad { border-left-color: var(--attack); }
+.bad { color: var(--attack); }
+.warn { color: var(--defense); }
+.plink { color: inherit; text-decoration: underline dotted; }
+.pill.target { border: 1px solid var(--attack); }
+.pill.build { border-left: 3px solid var(--build); }
+.pill.unit { border-left: 3px solid var(--recruit); }
