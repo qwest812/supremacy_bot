@@ -11,6 +11,7 @@ package bot
 
 import (
 	"fmt"
+	"strings"
 
 	"supermessy_bot/internal/s1914"
 )
@@ -64,30 +65,55 @@ func stepCars(w *World, b *Budget, plan *Plan, busy map[int]bool) {
 	}
 }
 
-// stepBarracksFood — включить или выключить казармы по запасу зерна.
-func stepBarracksFood(w *World, r Rules, plan *Plan) {
+// barracksUnits — войска, ради которых казарма нужна: пока их не
+// производят, казарма стоит на паузе и не ест зерно (правило игрока,
+// 02.11.2026).
+var barracksUnits = []string{uCavalry, uStormtroopers}
+
+// stepBarracksPause — казарма включена, только пока в провинции производится
+// кавалерия или штурмовики; иначе — пауза.
+func stepBarracksPause(w *World, r Rules, plan *Plan) {
+	want := map[int]bool{}
+	var names []string
+	for _, ident := range barracksUnits {
+		if id := w.Unit(ident); id != 0 {
+			want[id] = true
+			names = append(names, w.G.UnitStats[id].Name)
+		}
+	}
+	kinds := strings.Join(names, " и ")
+	if kinds == "" {
+		kinds = "кавалерия и штурмовики"
+	}
 	grain := w.Amount(s1914.ResourceGrain)
 	daily := w.Daily(s1914.ResourceGrain)
-	low := grain < r.FoodLow && daily < 0
-	ok := grain > r.FoodOK || (daily > 0 && grain > r.FoodLow)
 	for _, p := range w.Mine() {
 		_, id := w.Has(p, bBarracks)
 		if id == 0 || !w.G.Finished(p, id) {
 			continue
 		}
+		var making []string
+		for _, pr := range p.Producing {
+			if want[pr.UnitTypeID] {
+				making = append(making, w.G.UnitStats[pr.UnitTypeID].Name+" до "+clock(pr.Ends, w.Now))
+			}
+		}
 		on := p.Enabled[id]
 		what := p.Name + ": " + w.G.Upgrades[id].Name
 		switch {
-		case on && low:
-			plan.add(Decision{Category: CatRecruit, Rule: "казарма-по-еде", What: what + " — выключить",
-				Why: fmt.Sprintf("зерна мало: %s, прирост %s в сутки (порог %s); казарма ест зерно",
-					num(grain), num(daily), num(r.FoodLow)),
+		case len(making) == 0 && on:
+			plan.add(Decision{Category: CatRecruit, Rule: "казарма-пауза", What: what + " — пауза",
+				Why: fmt.Sprintf("здесь не производятся %s — казарма простаивает и ест зерно (сейчас %s, прирост %s в сутки)",
+					kinds, num(grain), num(daily)),
 				Action: s1914.ToggleAction(w.G, p.ID, id, false), Province: p.ID})
-		case !on && ok:
-			plan.add(Decision{Category: CatRecruit, Rule: "казарма-по-еде", What: what + " — включить",
-				Why: fmt.Sprintf("зерна снова хватает: %s, прирост %s в сутки; с казармой призыв быстрее",
-					num(grain), num(daily)),
+		case len(making) > 0 && !on:
+			plan.add(Decision{Category: CatRecruit, Rule: "казарма-пауза", What: what + " — включить",
+				Why:    "здесь производится " + strings.Join(making, ", ") + " — казарма нужна",
 				Action: s1914.ToggleAction(w.G, p.ID, id, true), Province: p.ID})
+		case len(making) > 0 && grain < r.FoodLow && daily < 0:
+			plan.noteAt(p.ID, CatRecruit, "казарма-пауза", what,
+				fmt.Sprintf("зерна мало (%s, прирост %s в сутки), но здесь производится %s — казарму не выключаем",
+					num(grain), num(daily), strings.Join(making, ", ")))
 		}
 	}
 }

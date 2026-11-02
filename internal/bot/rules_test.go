@@ -115,33 +115,63 @@ func barracksWorld(t *testing.T, enabled bool, grain, daily float64) *World {
 	return NewWorld(w.G, w.Geo, w.Now)
 }
 
-func TestBarracksOffWhenFoodLow(t *testing.T) {
-	w := barracksWorld(t, true, 1000, -500)
-	got := find(Decide(w, DefaultRules(), freshMem()), "казарма-по-еде", true)
-	if len(got) != 1 || !strings.Contains(got[0].What, "выключить") {
-		t.Fatalf("казарму не выключили при нехватке зерна: %+v", got)
-	}
-}
-
-func TestBarracksOnWhenFoodOK(t *testing.T) {
-	// В записанной партии игрок сам выключил три казармы, когда зерна
-	// было мало, — при достатке бот включает их все, и нашу тоже.
-	w := barracksWorld(t, false, 20000, 100)
-	got := find(Decide(w, DefaultRules(), freshMem()), "казарма-по-еде", true)
-	if len(got) < 1 {
-		t.Fatal("казарму не включили, когда зерна хватает")
-	}
-	for _, d := range got {
-		if !strings.Contains(d.What, "включить") {
-			t.Errorf("при достатке зерна: %s", d.What)
+// barracksAt — провинция с казармой из barracksWorld.
+func barracksAt(w *World) int {
+	for _, p := range w.Mine() {
+		if _, id := w.Has(p, bBarracks); id != 0 && w.G.Finished(p, id) {
+			return p.ID
 		}
 	}
+	return 0
 }
 
-func TestBarracksLeftAloneBetweenThresholds(t *testing.T) {
-	w := barracksWorld(t, true, 5000, -100)
-	if got := find(Decide(w, DefaultRules(), freshMem()), "казарма-по-еде", true); len(got) != 0 {
-		t.Fatalf("казарму дёрнули между порогами: %+v", got)
+// producing — в провинции производится войско unit.
+func producing(w *World, province int, unit string) *World {
+	for i, p := range w.G.Provinces {
+		if p.ID == province {
+			p.Producing = append(p.Producing, s1914.Production{UnitTypeID: w.Unit(unit), Ends: w.Now.Add(time.Hour)})
+			w.G.Provinces[i] = p
+		}
+	}
+	return NewWorld(w.G, w.Geo, w.Now)
+}
+
+// Казарма, в которой не делают кавалерию или штурмовиков, — на паузу,
+// даже если зерна много.
+func TestIdleBarracksPaused(t *testing.T) {
+	w := barracksWorld(t, true, 20000, 100)
+	got := find(Decide(w, DefaultRules(), freshMem()), "казарма-пауза", true)
+	if len(got) != 1 || !strings.Contains(got[0].What, "пауза") || got[0].Province != barracksAt(w) {
+		t.Fatalf("простаивающую казарму не поставили на паузу: %+v", got)
+	}
+}
+
+// Пехота и бронеавтомобили казарму не держат.
+func TestBarracksPausedWhenOnlyCars(t *testing.T) {
+	w := barracksWorld(t, true, 20000, 100)
+	w = producing(w, barracksAt(w), uCar)
+	if got := find(Decide(w, DefaultRules(), freshMem()), "казарма-пауза", true); len(got) != 1 {
+		t.Fatalf("казарма с одними машинками не на паузе: %+v", got)
+	}
+}
+
+// Делают кавалерию — казарму включаем, и не выключаем даже при нехватке
+// зерна (только предупреждаем).
+func TestBarracksOnForCavalry(t *testing.T) {
+	w := barracksWorld(t, false, 20000, 100)
+	w = producing(w, barracksAt(w), uCavalry)
+	got := find(Decide(w, DefaultRules(), freshMem()), "казарма-пауза", true)
+	if len(got) != 1 || !strings.Contains(got[0].What, "включить") {
+		t.Fatalf("казарму под кавалерию не включили: %+v", got)
+	}
+	w = barracksWorld(t, true, 1000, -500)
+	w = producing(w, barracksAt(w), uStormtroopers)
+	plan := Decide(w, DefaultRules(), freshMem())
+	if acts := find(plan, "казарма-пауза", true); len(acts) != 0 {
+		t.Fatalf("казарму со штурмовиками выключили: %+v", acts)
+	}
+	if notes := find(plan, "казарма-пауза", false); len(notes) != 1 {
+		t.Fatalf("нет предупреждения о зерне: %+v", notes)
 	}
 }
 

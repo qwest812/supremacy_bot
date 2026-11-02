@@ -4,11 +4,10 @@ package bot
 // в коде (economy.go, recruit.go, market.go, diplomacy.go), а пороги —
 // здесь, чтобы их можно было подстраивать из .env, не трогая логику.
 type Rules struct {
-	// Еда для казарм: казарма ест зерно (1000 в сутки). Ниже FoodLow
-	// при отрицательном приросте казармы выключаем, выше FoodOK — включаем
-	// обратно. Разрыв между порогами — чтобы не дёргать рубильник туда-сюда.
+	// FoodLow — мало зерна: казарма, в которой производится кавалерия или
+	// штурмовики, остаётся включённой, но бот об этом предупреждает.
+	// Без такого производства казарма и так стоит на паузе.
 	FoodLow float64
-	FoodOK  float64
 
 	// RailwayDay, HarbourDay, FactoryReserveDay — с какого дня партии
 	// работает правило. Сама игра тоже не даёт строить раньше своего дня
@@ -99,7 +98,6 @@ type Rules struct {
 func DefaultRules() Rules {
 	return Rules{
 		FoodLow:             3000,
-		FoodOK:              8000,
 		HarbourDay:          2,
 		RailwayDay:          3,
 		FactoryReserveDay:   5,

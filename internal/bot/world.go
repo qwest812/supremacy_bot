@@ -27,8 +27,10 @@ const (
 
 // Имена типов юнитов у игры (identifier строчными).
 const (
-	uInfantry = "infantry"
-	uCar      = "car"
+	uInfantry      = "infantry"
+	uCar           = "car"
+	uCavalry       = "cavalry"
+	uStormtroopers = "stormtroopers"
 )
 
 // World — партия глазами бота на один заход: состояние, карта и всё, что
