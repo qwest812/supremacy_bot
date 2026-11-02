@@ -8,10 +8,10 @@ package bot
 //     с OilFromDay нефть (их держим не меньше StrategicStock).
 //  2. Покупка на бирже. Нужное сейчас — не дороже справочной цены
 //     ×BuyMarkup; впрок — только дёшево, не дороже ×CheapMarkup.
-//  3. Обмен. Чего не купили — просим у бота или живого игрока в обмен
-//     на свой излишек, по справочным ценам с небольшой переплатой
-//     (SwapRatio), чтобы согласились.
-//  4. Продажа за деньги — только ботам и только того, что лежит сверх
+//  3. Обмен. Чего не купили — просим у живого игрока в обмен на свой
+//     излишек, по справочным ценам с небольшой переплатой (SwapRatio),
+//     чтобы согласились. Боты прямых сделок не принимают.
+//  4. Продажа за деньги — живым игрокам и только того, что лежит сверх
 //     KeepStock + SellAbove: излишек сначала нужен на обмен. На бирже
 //     не продаём: там теряется 20%.
 //
@@ -46,7 +46,7 @@ func planMarket(w *World, b *Budget, r Rules, mem *Memory, plan *Plan) {
 	tradeResults(w, mem, plan)
 	// Обещанное в висящих предложениях уйдёт, как только их примут:
 	// считаем его отданным.
-	for _, o := range w.G.Market.Outgoing {
+	for _, o := range waiting(w) {
 		b.Pay(o.OffersA, false)
 	}
 	needs := deficits(w, b, r)
@@ -62,7 +62,7 @@ func planMarket(w *World, b *Budget, r Rules, mem *Memory, plan *Plan) {
 		plan.note(CatMarket, "дефицит", "дефицит", strings.Join(parts, "; "))
 	}
 	buyNeeds(w, b, r, needs, plan)
-	if n := len(w.G.Market.Outgoing); n >= r.MaxPending {
+	if n := len(waiting(w)); n >= r.MaxPending {
 		plan.note(CatMarket, "ждём-ответа", "предложения",
 			fmt.Sprintf("без ответа висит %d наших предложений (предел %d) — новых не шлём, ждём ответов", n, r.MaxPending))
 		return
@@ -283,16 +283,30 @@ func buyNeeds(w *World, b *Budget, r Rules, needs []need, plan *Plan) {
 	}
 }
 
-// partners — с кем меняться: боты, а если разрешено — и живые игроки.
-// С врагом игра торговать не даёт.
+// partners — с кем торговать напрямую: только живые игроки. Боты прямых
+// сделок не принимают (сказал игрок 02.11.2026; вживую наши предложения
+// ботам так и висели без ответа). С врагом игра торговать не даёт.
 func partners(w *World, r Rules) []s1914.Player {
-	out := w.NativeBots()
-	if r.TradeHumans {
-		for _, id := range sortedPlayers(w) {
-			pl := w.G.Players[id]
-			if id != w.G.Me && !pl.IsAI && !pl.Defeated && !pl.Retired {
-				out = append(out, pl)
-			}
+	if !r.TradeHumans {
+		return nil
+	}
+	var out []s1914.Player
+	for _, id := range sortedPlayers(w) {
+		pl := w.G.Players[id]
+		if id != w.G.Me && !pl.IsAI && !pl.Defeated && !pl.Retired {
+			out = append(out, pl)
+		}
+	}
+	return out
+}
+
+// waiting — наши предложения, на которые ещё может прийти ответ: ботам
+// не в счёт, они не отвечают.
+func waiting(w *World) []s1914.TradeOffer {
+	var out []s1914.TradeOffer
+	for _, o := range w.G.Market.Outgoing {
+		if pl, ok := w.G.Players[o.PartyB]; ok && !pl.IsAI {
+			out = append(out, o)
 		}
 	}
 	return out
@@ -379,10 +393,7 @@ func swapForNeeds(w *World, b *Budget, r Rules, mem *Memory, needs []need, plan 
 		offer := map[int]float64{give: giveAmount}
 		b.Pay(offer, false)
 		sent++
-		who := "боту"
-		if !partner.IsAI {
-			who = "живому игроку"
-		}
+		who := "игроку"
 		plan.add(Decision{Category: CatMarket, Rule: "обмен",
 			What: fmt.Sprintf("%s → %s: %s %s за %s %s", w.ResName(give), partner.Nation,
 				num(giveAmount), w.ResName(give), num(want), w.ResName(n.res)),
@@ -397,7 +408,7 @@ func swapForNeeds(w *World, b *Budget, r Rules, mem *Memory, needs []need, plan 
 
 // sellSurplus — правило 4.
 func sellSurplus(w *World, b *Budget, r Rules, mem *Memory, needs []need, plan *Plan, sent int) {
-	bots := w.NativeBots()
+	bots := partners(w, r)
 	if len(bots) == 0 {
 		return
 	}
@@ -420,7 +431,7 @@ func sellSurplus(w *World, b *Budget, r Rules, mem *Memory, needs []need, plan *
 		amount := math.Floor(min(surplus, r.TradeChunk)/100) * 100
 		bot, ok := pickBot(w, bots, res, mem, used)
 		if !ok {
-			plan.note(CatMarket, "продажа-ботам", w.ResName(res), "все боты недавно отказались брать этот ресурс")
+			plan.note(CatMarket, "продажа-игрокам", w.ResName(res), "все игроки недавно отказались брать этот ресурс")
 			continue
 		}
 		used[bot.ID] = true
@@ -428,9 +439,9 @@ func sellSurplus(w *World, b *Budget, r Rules, mem *Memory, needs []need, plan *
 		give := map[int]float64{res: amount}
 		b.Pay(give, false)
 		sent++
-		plan.add(Decision{Category: CatMarket, Rule: "продажа-ботам",
+		plan.add(Decision{Category: CatMarket, Rule: "продажа-игрокам",
 			What: fmt.Sprintf("%s → %s: %s за %s денег", w.ResName(res), bot.Nation, num(amount), num(money)),
-			Why: fmt.Sprintf("излишек %s %s сверх запаса %s и резерва на обмен %s; боты берут по %.0f за единицу, "+
+			Why: fmt.Sprintf("излишек %s %s сверх запаса %s и резерва на обмен %s; предлагаем игроку по %.0f за единицу, "+
 				"на бирже не продаём (теряем 20%%, справочная %.1f)",
 				w.ResName(res), num(surplus+r.SellAbove), num(r.KeepStock), num(r.SellAbove), r.TradeRate, w.G.Market.Prices[res]),
 			Action: s1914.PlayerTradeOffer(w.G.Me, bot.ID, give, map[int]float64{s1914.ResourceMoney: money}, w.Now),

@@ -46,7 +46,7 @@ func intents(w *World, r Rules, mem *Memory, plan *Plan) []Intent {
 	}
 
 	// Наши предложения без ответа.
-	for _, o := range w.G.Market.Outgoing {
+	for _, o := range waiting(w) {
 		out = append(out, Intent{When: "ждёт ответа", Category: CatMarket,
 			What: fmt.Sprintf("%s → %s", offerText(w, o.OffersA), nationOf(w, o.PartyB)),
 			Why:  "просим " + offerText(w, o.OffersB) + "; отправлено " + clock(o.Time, w.Now)})
