@@ -38,8 +38,13 @@ const (
 	// Версия и клиент, которыми представляется браузерный клиент игры.
 	// Версия здесь — только начальная догадка: игру обновляют без нас, и на
 	// устаревшую она отвечает отказом, из которого видно нужный номер.
-	gsVersionDefault = "316"
-	gsClient         = "s1914-client-mobile"
+	//
+	// Клиент — настольный «ultimate», как у браузера (снято 02.11.2026).
+	// Поля «rights» браузер не шлёт, и с ним игра к ноябрю 2026 перестала
+	// пускать игроком: активация проходит, а состояние отвечает
+	// UltAuthentificationException (reason 6). Наблюдателем пускает и так.
+	gsVersionDefault = "299"
+	gsClient         = "s1914-client-ultimate"
 )
 
 // reDeployedVersion достаёт актуальный номер клиента из жалобы игры:
@@ -630,9 +635,9 @@ func (c *Client) enter(ctx context.Context, gameID string) (*gameAccess, *GameSt
 		"selectedPlayerID":              -1,
 		"selectedTeamID":                -1,
 		"randomTeamAndCountrySelection": false,
-		"os":                            "Linux ",
+		"os":                            "Windows 10",
 		"device":                        "desktop",
-		"isMobileClient":                true,
+		"isMobileClient":                false,
 	}, &playerID); err != nil {
 		return nil, nil, err
 	}
@@ -661,10 +666,10 @@ func (c *Client) gameState(ctx context.Context, acc *gameAccess, gameID string,
 			"resolution": "1920x1080",
 			"sysInfos": map[string]any{
 				"@c":             "ultshared.action.UltSystemInfos",
-				"os":             "Linux ",
+				"os":             "Windows 10",
 				"device":         "desktop",
 				"browser":        "chrome",
-				"isMobileClient": true,
+				"isMobileClient": false,
 				"assetQuality":   "high",
 				"mapQuality":     "high",
 				"gpuQuality":     "high",
@@ -760,7 +765,6 @@ func (c *Client) gsSend(ctx context.Context, acc *gameAccess, gameID string, req
 		"adminLevel": 0,
 		"gameID":     numeric(gameID),
 		"playerID":   playerID,
-		"rights":     "chat",
 		"userAuth":   acc.auth,
 		"tstamp":     acc.tstamp,
 	}
