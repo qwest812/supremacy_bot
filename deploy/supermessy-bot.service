@@ -1,0 +1,18 @@
+# systemd-сервис бота. Положить в /etc/systemd/system/, поправить User
+# и WorkingDirectory, затем:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now supermessy-bot
+# Журнал запуска: journalctl -u supermessy-bot -f
+[Unit]
+Description=Supremacy 1914 bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=bot
+WorkingDirectory=/opt/supermessy_bot
+ExecStart=/opt/supermessy_bot/bot
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
