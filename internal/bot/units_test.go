@@ -108,3 +108,16 @@ func TestBarracksOnWhenCavalryOrdered(t *testing.T) {
 		t.Fatalf("казарму под заказанную кавалерию не включили: %+v", got)
 	}
 }
+
+// Нефть убывает и её мало — бронеавтомобиль за нефть не заказываем.
+func TestNoUnitsFromDrainingResource(t *testing.T) {
+	w := fixtureWorld(t)
+	market(w, 1e6)
+	x := w.G.Resources[s1914.ResourceOil]
+	x.Amount, x.Daily = 1500, -3900
+	w.G.Resources[s1914.ResourceOil] = x
+	w, at := canProduce(t, w, uCar)
+	if got := onlyUnits(w, DefaultRules(), at); len(got) != 0 {
+		t.Fatalf("заказали войско за последнюю нефть: %s", got[0].What)
+	}
+}

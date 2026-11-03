@@ -143,3 +143,22 @@ func TestNoDirectOffersToBots(t *testing.T) {
 		}
 	}
 }
+
+// Ресурс ушёл в минус — покупаем и втридорога, но не дороже ×EmergencyMarkup.
+func TestEmergencyBuyWhenNegative(t *testing.T) {
+	w := fixtureWorld(t)
+	w.G.Day = 4
+	market(w, 50000, s1914.Order{ID: 1, Resource: s1914.ResourceGrain, Amount: 20000, Limit: 15, Player: 99})
+	x := w.G.Resources[s1914.ResourceGrain]
+	x.Amount, x.Daily, x.Rate = -2000, -5400, -5400.0/86400
+	w.G.Resources[s1914.ResourceGrain] = x
+	got := find(marketOnly(w, freshMem()), "купить-срочно", true)
+	if len(got) != 1 {
+		t.Fatalf("зерно в минусе, а срочно не купили: %+v", got)
+	}
+	// Втридорога, но в пределах ×4: 15 при справочной 5 — да; 25 — нет.
+	w.G.Market.Asks[0].Limit = 25
+	if got := find(marketOnly(w, freshMem()), "купить-срочно", true); len(got) != 0 {
+		t.Fatalf("купили дороже ×4: %s", got[0].What)
+	}
+}

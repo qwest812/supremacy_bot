@@ -34,12 +34,15 @@ var sellOrder = []int{s1914.ResourceWood, s1914.ResourceIron, s1914.ResourceCoal
 	s1914.ResourceOil, s1914.ResourceGas, s1914.ResourceFish, s1914.ResourceGrain}
 
 // need — дефицитный ресурс: сколько добрать и почему. urgent — нужен
-// сейчас или скоро кончится; иначе это запас впрок.
+// сейчас или скоро кончится; иначе это запас впрок. emergency — уже
+// в минусе или кончится за EmergencyDays: тогда emergency единиц берём
+// и дорого.
 type need struct {
-	res    int
-	amount float64
-	urgent bool
-	why    []string
+	res       int
+	amount    float64
+	urgent    bool
+	emergency float64
+	why       []string
 }
 
 func planMarket(w *World, b *Budget, r Rules, mem *Memory, plan *Plan) {
@@ -115,6 +118,18 @@ func deficits(w *World, b *Budget, r Rules) []need {
 				num(daily), r.ForecastDays, num(max(left, 0))))
 		}
 	}
+	// Экстренно: в минусе или вот-вот будет.
+	for _, res := range sellOrder {
+		left := w.Amount(res) + min(w.Daily(res), 0)*r.EmergencyDays
+		if left >= 0 {
+			continue
+		}
+		amount := -left - min(w.Daily(res), 0)*r.EmergencyDays
+		add(res, amount, true, fmt.Sprintf("СРОЧНО: запас %s, прирост %s в сутки — уходим в минус", num(w.Amount(res)), num(w.Daily(res))))
+		if n := byRes[res]; n != nil {
+			n.emergency = max(n.emergency, amount)
+		}
+	}
 	list, why := strategic(w, r)
 	for _, res := range list {
 		if free := b.Free(res); free < r.StrategicStock {
@@ -127,6 +142,9 @@ func deficits(w *World, b *Budget, r Rules) []need {
 		out = append(out, *n)
 	}
 	sort.Slice(out, func(i, j int) bool {
+		if (out[i].emergency > 0) != (out[j].emergency > 0) {
+			return out[i].emergency > 0
+		}
 		if out[i].urgent != out[j].urgent {
 			return out[i].urgent
 		}
@@ -251,6 +269,27 @@ func buyNeeds(w *World, b *Budget, r Rules, needs []need, plan *Plan) {
 			if n.amount <= 0 {
 				break
 			}
+			// Экстренную часть берём и дорого.
+			if n.emergency > 0 && price > 0 && o.Limit > price*markup && o.Limit <= price*r.EmergencyMarkup {
+				amount := math.Ceil(min(n.emergency, o.Amount))
+				if spare := b.Free(s1914.ResourceMoney) - r.MoneyKeep; amount*o.Limit > spare {
+					amount = math.Floor(spare / o.Limit)
+				}
+				if amount >= 1 {
+					cost := amount * o.Limit
+					b.Pay(map[int]float64{s1914.ResourceMoney: cost}, false)
+					n.amount -= amount
+					n.emergency -= amount
+					plan.add(Decision{Category: CatMarket, Rule: "купить-срочно",
+						What: fmt.Sprintf("купить %s %s по %.1f", w.ResName(res), num(amount), o.Limit),
+						Why: fmt.Sprintf("%s; дорого (справочная %.1f), но минус по ресурсу хуже — берём до ×%.0f, "+
+							"сколько нужно, чтобы выйти в плюс на %.1f суток", strings.Join(n.why, "; "), price,
+							r.EmergencyMarkup, r.EmergencyDays),
+						Action: s1914.MarketDeal(w.G.Me, o, amount),
+						Cost:   map[int]float64{s1914.ResourceMoney: cost}})
+					continue
+				}
+			}
 			if price > 0 && o.Limit > price*markup {
 				plan.note(CatMarket, "купить-на-бирже", w.ResName(res),
 					fmt.Sprintf("нужно %s (%s), но дешевле %.1f за единицу не продают; берём не дороже %.1f (справочная %.1f ×%.1f)",
@@ -301,13 +340,16 @@ func partners(w *World, r Rules) []s1914.Player {
 }
 
 // waiting — наши предложения, на которые ещё может прийти ответ: ботам
-// не в счёт, они не отвечают.
+// не в счёт, они не отвечают; без ответа дольше игровых суток — тоже:
+// их уже не примут, а лимит висящих они занимали бы вечно.
 func waiting(w *World) []s1914.TradeOffer {
 	var out []s1914.TradeOffer
 	for _, o := range w.G.Market.Outgoing {
-		if pl, ok := w.G.Players[o.PartyB]; ok && !pl.IsAI {
-			out = append(out, o)
+		pl, ok := w.G.Players[o.PartyB]
+		if !ok || pl.IsAI || (!o.Time.IsZero() && w.Now.Sub(o.Time) > w.GameDay()) {
+			continue
 		}
+		out = append(out, o)
 	}
 	return out
 }
@@ -338,7 +380,7 @@ func pickBot(w *World, bots []s1914.Player, res int, mem *Memory, used map[int]b
 
 // pending — у игрока висит наше предложение без ответа: второе не шлём.
 func pending(w *World, player int) bool {
-	for _, o := range w.G.Market.Outgoing {
+	for _, o := range waiting(w) {
 		if o.PartyB == player {
 			return true
 		}

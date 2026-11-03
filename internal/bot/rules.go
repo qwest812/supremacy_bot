@@ -46,6 +46,12 @@ type Rules struct {
 	StrategicStock float64
 	OilFromDay     int
 	ForecastDays   float64
+	// EmergencyDays и EmergencyMarkup — экстренная закупка: ресурс уже
+	// в минусе или кончится за EmergencyDays суток. Тогда берём на бирже
+	// и дорого, до справочной ×EmergencyMarkup: минус по ресурсу бьёт по
+	// боевому духу и производству сильнее, чем переплата.
+	EmergencyDays   float64
+	EmergencyMarkup float64
 	// CheapMarkup — впрок (под будущий дефицит) покупаем на бирже, только
 	// если цена не выше справочной больше чем в CheapMarkup раз.
 	CheapMarkup float64
@@ -119,6 +125,8 @@ func DefaultRules() Rules {
 		OilFromDay:          6,
 		ForecastDays:        2,
 		CheapMarkup:         1.0,
+		EmergencyDays:       0.5,
+		EmergencyMarkup:     4,
 		SwapRatio:           1.1,
 		SellAbove:           8000,
 		TradeHumans:         true,

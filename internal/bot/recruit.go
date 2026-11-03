@@ -52,6 +52,17 @@ func scarce(w *World, r Rules, b *Budget, res int) bool {
 	return false
 }
 
+// drains — войско тратит убывающий ресурс так, что его останется меньше
+// KeepStock: такое не заказываем, иначе ресурс уйдёт в минус.
+func drains(w *World, r Rules, b *Budget, cost map[int]float64) (int, bool) {
+	for _, res := range sortedRes(cost) {
+		if res != s1914.ResourceMoney && w.Daily(res) < 0 && b.Free(res)-cost[res] < r.KeepStock {
+			return res, true
+		}
+	}
+	return 0, false
+}
+
 // unitOptions — что можно заказать в провинции, лучшие первыми.
 func unitOptions(w *World, r Rules, b *Budget, p s1914.Province) []unitOption {
 	allowed := map[int]bool{}
@@ -115,11 +126,21 @@ func stepUnits(w *World, r Rules, b *Budget, plan *Plan) map[int][]int {
 		}
 		// Лучшее, на что хватает; если не хватает ни на что — ждём лучшее.
 		var pick *unitOption
+		var drained []string
 		for i := range opts {
+			if res, bad := drains(w, r, b, opts[i].cost); bad {
+				drained = append(drained, fmt.Sprintf("%s (%s на исходе)", opts[i].name, w.ResName(res)))
+				continue
+			}
 			if ok, _, _ := b.Check(opts[i].cost, false); ok {
 				pick = &opts[i]
 				break
 			}
+		}
+		if pick == nil && len(drained) == len(opts) {
+			plan.noteAt(p.ID, CatRecruit, "производство", p.Name,
+				"не заказываем: "+strings.Join(drained, ", ")+fmt.Sprintf(" — запас убывает, ниже %s не тратим", num(r.KeepStock)))
+			continue
 		}
 		if pick == nil {
 			best := opts[0]

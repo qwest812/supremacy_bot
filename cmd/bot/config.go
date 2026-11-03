@@ -122,6 +122,8 @@ func loadSettings() (settings, error) {
 	r.OilFromDay = integer("TRADE_OIL_FROM_DAY", r.OilFromDay)
 	r.ForecastDays = flt("TRADE_FORECAST_DAYS", r.ForecastDays)
 	r.CheapMarkup = flt("TRADE_CHEAP_MARKUP", r.CheapMarkup)
+	r.EmergencyDays = flt("TRADE_EMERGENCY_DAYS", r.EmergencyDays)
+	r.EmergencyMarkup = flt("TRADE_EMERGENCY_MARKUP", r.EmergencyMarkup)
 	r.SwapRatio = flt("TRADE_SWAP_RATIO", r.SwapRatio)
 	r.SellAbove = flt("TRADE_SELL_ABOVE", r.SellAbove)
 	r.TradeHumans = boolean("TRADE_WITH_HUMANS", r.TradeHumans)
